@@ -14,6 +14,7 @@ ci-data 分支读写工具
 
 import os
 import re
+import json
 import base64
 import requests
 from datetime import datetime
@@ -110,6 +111,53 @@ def is_fix_notified(pr_number: int) -> bool:
 def mark_fix_notified(pr_number: int) -> None:
     write_file(fix_notified_path(pr_number), "notified",
                f"fix-notified: PR #{pr_number}", branch=CI_FIX_BRANCH)
+
+
+# ── 就地修复状态（create-image PR）─────────────────────────────────────────
+# create-image workflow 产出的新镜像 PR 的 head 分支在我们自己的 fork 上，
+# 采用就地修复（往原 PR 分支追加 commit）。这里记录已尝试次数与最近一次已
+# dispatch 修复的 head_sha，用于：(1) 重试上限控制 (2) 同一 head 去重，避免
+# CI 尚未重跑时重复 dispatch。计数与分支位置无关，故不依赖 git compare。
+
+def inplace_state_path(pr_number: int) -> str:
+    return f"ci-fix-log/{pr_number}/inplace-fix-state.json"
+
+
+def read_inplace_state(pr_number: int) -> dict:
+    """返回 {'attempts': int, 'last_sha': str}，无记录时返回零值。"""
+    raw = read_file(inplace_state_path(pr_number), branch=CI_FIX_BRANCH)
+    if not raw:
+        return {'attempts': 0, 'last_sha': ''}
+    try:
+        data = json.loads(raw)
+        return {'attempts': int(data.get('attempts', 0)),
+                'last_sha': str(data.get('last_sha', ''))}
+    except Exception:
+        return {'attempts': 0, 'last_sha': ''}
+
+
+def record_inplace_attempt(pr_number: int, head_sha: str) -> dict:
+    """累加一次就地修复尝试并记录本次 head_sha，返回更新后的状态。"""
+    state = read_inplace_state(pr_number)
+    state['attempts'] = state.get('attempts', 0) + 1
+    state['last_sha'] = head_sha
+    write_file(inplace_state_path(pr_number), json.dumps(state),
+               f"inplace-fix-state: PR #{pr_number} attempt {state['attempts']}",
+               branch=CI_FIX_BRANCH)
+    return state
+
+
+def giveup_notified_path(pr_number: int) -> str:
+    return f"ci-fix-log/{pr_number}/giveup-notified"
+
+
+def is_giveup_notified(pr_number: int) -> bool:
+    return bool(read_file(giveup_notified_path(pr_number), branch=CI_FIX_BRANCH))
+
+
+def mark_giveup_notified(pr_number: int) -> None:
+    write_file(giveup_notified_path(pr_number), "notified",
+               f"giveup-notified: PR #{pr_number}", branch=CI_FIX_BRANCH)
 
 
 # ── 共享知识库（main 分支）───────────────────────────────────────────────

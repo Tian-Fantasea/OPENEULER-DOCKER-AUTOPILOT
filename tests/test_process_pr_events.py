@@ -8,7 +8,7 @@ Tests for scripts/watch/process_pr_events.py
 
 import pytest
 
-from scripts.watch.process_pr_events import _is_prerelease
+from scripts.watch.process_pr_events import _is_prerelease, _is_create_image_pr
 
 
 class TestIsPrerelease:
@@ -108,3 +108,186 @@ class TestIsFixPrTitle:
     ])
     def test_non_fix_titles_are_not_skipped(self, title):
         assert _is_fix_pr_title(title) is False, f"Should not skip: {title}"
+
+
+# ── create-image PR 识别（就地修复路由）────────────────────────────────────────
+
+class TestIsCreateImagePr:
+
+    # ── 按标题识别（create-image workflow 生成的确定性标题）──────────────────────
+
+    @pytest.mark.parametrize("title", [
+        'Feat: add fluid 1.2.3 docker image on openEuler 24.03-LTS-SP3',
+        'feat: add kafka 3.5.0 docker image on openeuler 24.03-lts-sp3',  # 全小写
+        'Feat: add some-tool 0.1.0 docker image on openEuler 22.03-LTS',
+    ])
+    def test_create_image_titles_detected(self, title):
+        assert _is_create_image_pr({'title': title}) is True, f"Expected create-image: {title}"
+
+    # ── 按 head 分支前缀识别（标题格式漂移时的兜底）──────────────────────────────
+
+    def test_detected_by_add_branch_prefix(self):
+        pr = {'title': '随便一个标题', 'head': {'ref': 'add-fluid'}}
+        assert _is_create_image_pr(pr) is True
+
+    def test_title_match_without_head(self):
+        pr = {'title': 'Feat: add fluid 1.2.3 docker image on openEuler 24.03'}
+        assert _is_create_image_pr(pr) is True
+
+    # ── 不应误判为 create-image PR ───────────────────────────────────────────────
+
+    @pytest.mark.parametrize("pr", [
+        {'title': '【自动升级】etcd容器镜像升级至3.6.11版本.', 'head': {'ref': 'etcd-3.6.11'}},
+        {'title': 'fix: etcd 3.6.11 (fix #2534)', 'head': {'ref': 'fix/2534'}},
+        {'title': 'feat: add new feature', 'head': {'ref': 'feature/x'}},  # 无 'docker image on openEuler'
+        {'title': 'chore: update deps', 'head': {'ref': 'chore-1'}},
+        {'title': '', 'head': {'ref': ''}},
+        {'title': ''},  # 无 head 字段
+    ])
+    def test_non_create_image_prs_not_detected(self, pr):
+        assert _is_create_image_pr(pr) is False, f"Should not detect: {pr}"
+
+
+# ── 就地修复决策（process_create_image_pr）────────────────────────────────────
+
+class _FakeApi:
+    def __init__(self):
+        self.comments = []
+
+    def add_pr_comment(self, repo, pr_number, body, token):
+        self.comments.append((pr_number, body))
+
+
+@pytest.fixture
+def inplace_env(monkeypatch):
+    """打桩 ci_data 与 dispatch_ci_fix，返回可断言的内存状态。"""
+    from scripts.watch import process_pr_events as mod
+
+    state = {
+        'inplace': {},          # pr_number -> {'attempts', 'last_sha'}
+        'giveup_notified': set(),
+        'dispatched': [],       # (pr_number, fix_branch)
+        'recorded': [],         # (pr_number, head_sha)
+    }
+
+    monkeypatch.setattr(mod.ci_data, 'read_inplace_state',
+                        lambda n: dict(state['inplace'].get(n, {'attempts': 0, 'last_sha': ''})))
+    monkeypatch.setattr(mod.ci_data, 'is_giveup_notified',
+                        lambda n: n in state['giveup_notified'])
+    monkeypatch.setattr(mod.ci_data, 'mark_giveup_notified',
+                        lambda n: state['giveup_notified'].add(n))
+
+    def _record(n, sha):
+        cur = state['inplace'].get(n, {'attempts': 0, 'last_sha': ''})
+        cur = {'attempts': cur['attempts'] + 1, 'last_sha': sha}
+        state['inplace'][n] = cur
+        state['recorded'].append((n, sha))
+        return cur
+    monkeypatch.setattr(mod.ci_data, 'record_inplace_attempt', _record)
+
+    def _dispatch(repo, platform, pr, pr_base, token, target_repo, fix_pr_number=0, fix_branch=None):
+        state['dispatched'].append((pr['number'], fix_branch))
+        return True
+    monkeypatch.setattr(mod, 'dispatch_ci_fix', _dispatch)
+
+    return mod, state
+
+
+def _make_pr(number=1, ref='add-fluid', sha='abc123', labels=('ci_failed',)):
+    return {
+        'number': number,
+        'title': 'Feat: add fluid 1.2.3 docker image on openEuler 24.03',
+        'head': {'ref': ref, 'sha': sha},
+        'labels': [{'name': l} for l in labels],
+    }
+
+
+class TestProcessCreateImagePr:
+
+    def test_first_attempt_dispatches_on_head_branch(self, inplace_env):
+        mod, state = inplace_env
+        api = _FakeApi()
+        pr = _make_pr(number=42, ref='add-fluid', sha='sha1')
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is True
+        # 就地修复：fix_branch 必须是 PR 自己的 head 分支
+        assert state['dispatched'] == [(42, 'add-fluid')]
+        assert state['recorded'] == [(42, 'sha1')]
+        assert api.comments == []
+
+    def test_same_sha_not_redispatched(self, inplace_env):
+        mod, state = inplace_env
+        state['inplace'][42] = {'attempts': 1, 'last_sha': 'sha1'}
+        api = _FakeApi()
+        pr = _make_pr(number=42, sha='sha1')
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is False
+        assert state['dispatched'] == []   # 同一 head 不重复 dispatch
+
+    def test_new_sha_after_fix_redispatches(self, inplace_env):
+        mod, state = inplace_env
+        state['inplace'][42] = {'attempts': 1, 'last_sha': 'oldsha'}
+        api = _FakeApi()
+        pr = _make_pr(number=42, sha='newsha')
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is True
+        assert state['dispatched'] == [(42, 'add-fluid')]
+        assert state['inplace'][42]['attempts'] == 2
+
+    def test_max_retries_notifies_human_without_dispatch(self, inplace_env):
+        mod, state = inplace_env
+        state['inplace'][42] = {'attempts': 6, 'last_sha': 'oldsha'}  # MAX_RETRIES == 6
+        api = _FakeApi()
+        pr = _make_pr(number=42, sha='newsha')
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is False
+        assert state['dispatched'] == []          # 不再修复
+        assert len(api.comments) == 1             # 评论提醒人工
+        assert 42 in state['giveup_notified']     # 不关闭 PR，仅标记已通知
+
+    def test_giveup_comment_is_idempotent(self, inplace_env):
+        mod, state = inplace_env
+        state['inplace'][42] = {'attempts': 6, 'last_sha': 'oldsha'}
+        state['giveup_notified'].add(42)
+        api = _FakeApi()
+        pr = _make_pr(number=42, sha='newsha')
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is False
+        assert api.comments == []                 # 已通知过，不重复评论
+
+    def test_ci_processing_skips(self, inplace_env):
+        mod, state = inplace_env
+        api = _FakeApi()
+        pr = _make_pr(number=42, labels=('ci_failed', 'ci_processing'))
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is False
+        assert state['dispatched'] == []
+
+    def test_ci_successful_skips(self, inplace_env):
+        mod, state = inplace_env
+        api = _FakeApi()
+        pr = _make_pr(number=42, labels=('ci_failed', 'ci_successful'))
+
+        result = mod.process_create_image_pr(api, 'o/r', 'gitcode', pr, 'master',
+                                             'wtok', 'dtok', 'me/repo')
+
+        assert result is False
+        assert state['dispatched'] == []

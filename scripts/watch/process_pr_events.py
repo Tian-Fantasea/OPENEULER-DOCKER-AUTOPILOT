@@ -44,13 +44,35 @@ def _is_prerelease(title: str) -> bool:
     return bool(_PRERELEASE_RE.search(title))
 
 
+# create-image workflow 产出的新镜像 PR 标题形如：
+#   'Feat: add <pkg> <version> docker image on openEuler <VER>'
+# head 分支形如 'add-<pkg>'。这类 PR 的分支在我们自己的 fork 上，
+# 应就地追加修复 commit（而非另开 fix PR）。
+_CREATE_IMAGE_TITLE_RE = re.compile(
+    r'^\s*feat:\s*add\b.*\bdocker image on openeuler\b', re.IGNORECASE,
+)
+
+
+def _is_create_image_pr(pr: Dict) -> bool:
+    """识别 create-image workflow 产出的新镜像 PR（按标题或 head 分支前缀）。"""
+    if _CREATE_IMAGE_TITLE_RE.search(pr.get('title', '')):
+        return True
+    head_ref = (pr.get('head') or {}).get('ref', '')
+    return head_ref.startswith('add-')
+
+
 def log(msg: str):
     ts = datetime.now().strftime('%H:%M:%S')
     print(f"[{ts}] {msg}", flush=True)
 
 
 def dispatch_ci_fix(repo: str, platform: str, pr: Dict, pr_base_branch: str,
-                    token: str, target_repo: str, fix_pr_number: int = 0) -> bool:
+                    token: str, target_repo: str, fix_pr_number: int = 0,
+                    fix_branch: Optional[str] = None) -> bool:
+    # 默认在独立的 fix/<n> 分支上修复并另开 fix PR；就地修复（create-image PR）时
+    # 由调用方传入原 PR 的 head 分支，使修复 commit 直接追加到原 PR。
+    if fix_branch is None:
+        fix_branch = f"fix/{pr['number']}"
     payload = {
         'event_type': 'run-ci-fix-phase',
         'client_payload': {
@@ -60,7 +82,7 @@ def dispatch_ci_fix(repo: str, platform: str, pr: Dict, pr_base_branch: str,
             'pr_number': pr['number'],
             'pr_title': pr.get('title', ''),
             'head_sha': pr['head']['sha'],
-            'fix_branch': f"fix/{pr['number']}",
+            'fix_branch': fix_branch,
             'pr_base_branch': pr_base_branch,
             # 重试时传入 fix PR 编号，让 ci-log-analysis 从 fix PR 评论中查找最新 build URL
             'fix_pr_number': fix_pr_number,
@@ -98,6 +120,63 @@ def _within_lookback(pr: Dict, cutoff: datetime) -> bool:
     if updated_at is None:
         return True  # 解析失败时默认处理
     return updated_at >= cutoff
+
+
+def process_create_image_pr(api, repo: str, platform: str, pr: Dict, pr_base: str,
+                            write_token: str, dispatch_token: str, target_repo: str) -> bool:
+    """就地修复 create-image PR：往该 PR 自己的 head 分支追加修复 commit，
+    不另开 fix PR。超过最大重试次数时评论提醒人工介入（保留 PR，不关闭，
+    因为它是关联 issue 的正主）。返回是否本轮发起了一次 dispatch。"""
+    pr_number = pr['number']
+    head = pr.get('head') or {}
+    head_ref = head.get('ref', '')
+    head_sha = head.get('sha', '')
+    labels = [l.get('name') for l in (pr.get('labels') or [])]
+
+    log(f"    → create-image PR, in-place fix on branch '{head_ref}'")
+
+    if 'ci_processing' in labels:
+        log("    → CI running (ci_processing), skipping")
+        return False
+    if 'ci_successful' in labels:
+        log("    → CI passed, nothing to fix")
+        return False
+
+    state = ci_data.read_inplace_state(pr_number)
+    attempts = state.get('attempts', 0)
+
+    # 已对当前 head 发起过修复 → 等待 CI/修复结果，避免重复 dispatch
+    if head_sha and state.get('last_sha') == head_sha:
+        log(f"    → already dispatched fix for sha {head_sha[:8]}, awaiting result, skipping")
+        return False
+
+    if attempts >= MAX_RETRIES:
+        if not ci_data.is_giveup_notified(pr_number):
+            log(f"    → max in-place retries ({MAX_RETRIES}) reached, notifying human (PR kept open)")
+            try:
+                api.add_pr_comment(
+                    repo, pr_number,
+                    f"🤖 AI 已就地尝试修复 {MAX_RETRIES} 次仍未通过 CI，已停止自动修复，"
+                    f"请人工介入处理本 PR。",
+                    write_token,
+                )
+                ci_data.mark_giveup_notified(pr_number)
+            except Exception as e:
+                log(f"    ⚠️ notify failed: {e}")
+        else:
+            log("    → already notified human, skipping")
+        return False
+
+    log(f"    → dispatching in-place fix attempt #{attempts + 1}")
+    inplace_pr = {'number': pr_number, 'title': pr.get('title', ''), 'head': head}
+    ok = dispatch_ci_fix(repo, platform, inplace_pr, pr_base, dispatch_token, target_repo,
+                         fix_branch=head_ref)
+    if ok:
+        try:
+            ci_data.record_inplace_attempt(pr_number, head_sha)
+        except Exception as e:
+            log(f"    ⚠️ record attempt failed (non-fatal): {e}")
+    return ok
 
 
 def process_all():
@@ -173,6 +252,13 @@ def process_all():
 
             if pr_title.lstrip().lower().startswith('fix:'):
                 log(f"    → Skipping: fix PR (title starts with 'fix:'), handles its own CI retries")
+                continue
+
+            # create-image PR：head 分支在我们自己的 fork 上，就地修复而非另开 fix PR
+            if _is_create_image_pr(pr):
+                if process_create_image_pr(api, repo, platform, pr, pr_base,
+                                           write_token, dispatch_token, target_repo):
+                    total_dispatched += 1
                 continue
 
             fix_pr = api.find_any_pr_by_head_branch(repo, fix_branch, token)
