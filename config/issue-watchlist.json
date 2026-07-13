@@ -7,7 +7,7 @@
       "trigger_title_keyword": "【new-image】",
       "creating_label": "image-creating",
       "done_label": "image-created",
-      "enabled": true,
+      "enabled": false,
       "description": "openEuler 官方容器镜像仓库，自动为新增上游软件包创建 Dockerfile 和 PR"
     }
   ],

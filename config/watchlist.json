@@ -4,7 +4,7 @@
       "repo": "https://gitcode.com/openeuler/openeuler-docker-images",
       "trigger_labels": ["ci_failed"],
       "trigger_mode": "command",
-      "enabled": true,
+      "enabled": false,
       "description": "Dockerfiles for openEuler official container images, include openEuler basic image and application images."
     }
   ],
