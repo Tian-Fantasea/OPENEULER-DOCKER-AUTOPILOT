@@ -60,47 +60,86 @@ docker-images-workflow 是一套面向容器镜像仓库的 **CI 失败自动修
 
 ## 二、架构设计
 
+> 采用「4+1」视图模型描述系统架构：
+
+| 视图 | 章节 | 关注点 |
+|------|------|--------|
+| **逻辑视图** | 2.1 | 系统功能分层、数据流转 |
+| **开发视图** | 2.2 | 代码组织、模块划分、依赖关系 |
+| **进程视图** | 2.3 | 运行时行为、并发控制、执行时序 |
+| **物理视图** | 2.4 | 部署拓扑、Runner 与外部服务的物理关系 |
+| **场景视图** | 2.5 | 典型用例串联全部视图 |
+
 ### 2.1 逻辑视图（Logical View）
 
 系统按职责分为五层：
 
+```mermaid
+flowchart TD
+    subgraph MONITOR["监控编排层 Monitor"]
+        M1["stream-pr-events.yml<br>cron / workflow_dispatch 轮询"]
+        M2["watchlist.json<br>监控仓库 + 轮询参数"]
+        M3["sync-poll-interval.yml<br>watchlist 变更 → 同步 cron"]
+    end
+
+    subgraph PIPELINE["修复执行层 Pipeline"]
+        P1["pr-ci-fix-trigger.yml"]
+        P2["Job: ci-log-analysis<br>scripts/stages/ci-log-analysis.py"]
+        P3["Job: code-fix<br>scripts/stages/code-fix.py"]
+        P1 --> P2
+        P2 -.->|"dispatch<br>phase=code-fix"| P3
+    end
+
+    subgraph AGENTL["AI Agent 层"]
+        AG1["ci-failure-analyst<br>诊断师角色 Prompt"]
+        AG2["code-fixer<br>修复工程师角色 Prompt"]
+        AG3["ai_runner.py<br>按 AI_RUNNER 调度"]
+        AG4["opencode_run.py"]
+        AG5["claude_code_run.py"]
+        AG3 --> AG4
+        AG3 --> AG5
+    end
+
+    subgraph APIL["平台抽象层 API"]
+        API1["ci_api.py<br>工厂：detect + normalize + get_api"]
+        API2["ci_github_api.py"]
+        API3["ci_gitcode_api.py<br>v5 PR + v4 Pipeline + Jenkins"]
+        API1 --> API2
+        API1 --> API3
+    end
+
+    subgraph STORAGE["数据持久层 Storage"]
+        S1[("ci-fix-log 分支<br>{pr}/ci-analysis.md<br>{pr}/code-fix-summary.md<br>{pr}/fix-notified")]
+        S2[("main 分支<br>docs/ci-failure-patterns.md<br>（知识库）")]
+    end
+
+    M2 --> M1
+    M3 -.->|"更新 cron 表达式"| M1
+    M1 -->|"repository_dispatch<br>run-ci-fix-phase"| P1
+
+    P2 -->|"调度诊断"| AG3
+    P2 -->|"获取 diff / 日志"| API1
+    P3 -->|"调度修复"| AG3
+    P3 -->|"获取 PR 文件列表"| API1
+    AG3 -.-> AG1
+    AG3 -.-> AG2
+
+    P2 -->|"写入诊断报告"| S1
+    P2 -->|"读取历史模式"| S2
+    P3 -->|"读取诊断报告"| S1
+    P3 -->|"写入修复摘要"| S1
+    M1 -->|"CI 通过后追加案例"| S2
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     监控编排层（Monitor）                      │
-│  stream-pr-events.yml  ←→  watchlist.json                   │
-│  sync-poll-interval.yml（同步 cron 表达式）                    │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ repository_dispatch
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│                    修复执行层（Pipeline）                       │
-│  pr-ci-fix-trigger.yml                                      │
-│  ├─ Job: ci-log-analysis ──→ scripts/stages/ci-log-analysis.py │
-│  └─ Job: code-fix        ──→ scripts/stages/code-fix.py     │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                ┌───────────┴───────────┐
-                ↓                       ↓
-┌──────────────────────┐  ┌──────────────────────────────────┐
-│   AI Agent 层         │  │       平台抽象层（API）             │
-│  ci-failure-analyst  │  │  ci_api.py (工厂)                 │
-│  code-fixer          │  │  ├─ ci_github_api.py              │
-│  ai_runner.py (调度)  │  │  └─ ci_gitcode_api.py            │
-│  ├─ opencode_run.py  │  └──────────────────────────────────┘
-│  └─ claude_code_run.py│
-└──────────────────────┘
-                            │
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│                    数据持久层（Storage）                        │
-│  ci-fix-log 分支：                                            │
-│    ci-fix-log/{pr_number}/ci-analysis.md                    │
-│    ci-fix-log/{pr_number}/code-fix-summary.md               │
-│    ci-fix-log/{pr_number}/fix-notified                      │
-│  main 分支：                                                  │
-│    docs/ci-failure-patterns.md（知识库）                      │
-└─────────────────────────────────────────────────────────────┘
-```
+
+**功能分层说明：**
+
+| 层级 | 职责 | 核心组件 |
+|------|------|---------|
+| **监控编排层** | 轮询 watched_repo，决策是否 dispatch 修复流程，CI 通过后回写知识库 | `stream-pr-events.yml` + `watchlist.json` + `sync-poll-interval.yml` |
+| **修复执行层** | 两阶段修复流水线的编排与串联 | `pr-ci-fix-trigger.yml`（Job: ci-log-analysis / code-fix） |
+| **AI Agent 层** | 诊断与修复的角色定义 + 多 AI 后端统一调度 | `ci-failure-analyst.md` / `code-fixer.md` + `ai_runner.py` |
+| **平台抽象层** | 屏蔽 GitHub / GitCode 平台差异，统一 API 接口 | `ci_api.py` 工厂 + `ci_github_api.py` + `ci_gitcode_api.py` |
+| **数据持久层** | 诊断报告、修复摘要、知识库的持久化读写 | `ci-fix-log` 分支 + `main` 分支 `ci_data.py` |
 
 ### 2.2 开发视图（Development View）
 
@@ -143,103 +182,179 @@ docker-images-workflow/
     └── test_process_pr_events.py   # 跳过规则（预发布 + fix: 前缀，41 用例）
 ```
 
+**模块依赖关系：**
+
+```
+┌──────────────────────┐
+│  ci_api.py（工厂）     │
+│  平台探测 + 归一化      │
+└──────────┬───────────┘
+           │ 被 stages/ 与 watch/ 共同依赖
+     ┌─────┴─────┐
+     ▼           ▼
+┌─────────┐ ┌──────────────┐
+│ci_github│ │ci_gitcode_api│
+│_api.py  │ │.py           │
+└─────────┘ └──────────────┘
+
+┌──────────────────────┐
+│  ai_runner.py（调度）  │
+└──────────┬───────────┘
+     ┌─────┴─────┐
+     ▼           ▼
+┌───────────┐ ┌──────────────────┐
+│opencode_run│ │claude_code_run.py│
+│.py         │ │                  │
+└───────────┘ └──────────────────┘
+
+┌─────────────────────────────────────────┐
+│  scripts/stages/（ci-log-analysis / code-fix）│
+│  依赖 ci_api + ai_runner + ci_data.py       │
+└─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│  scripts/watch/（process_pr_events）       │
+│  依赖 ci_api + ci_data.py + watchlist.json │
+└─────────────────────────────────────────┘
+```
+
 ### 2.3 进程视图（Process View）
 
-系统由三个独立触发的 GitHub Actions workflow 组成：
+系统由三个独立触发的 GitHub Actions workflow 组成。
 
-#### workflow 1：stream-pr-events.yml（Monitor，cron 触发）
+#### 2.3.1 workflow 1：stream-pr-events.yml（Monitor，cron 触发）
 
-```
-trigger: schedule (cron) 或 workflow_dispatch
-  │
-  ├─ 读取 watchlist.json
-  ├─ 对每个 watched_repo:
-  │    ├─ 调用平台 API 获取 ci_failed PRs
-  │    ├─ 对每条 PR:
-  │    │    ├─ 跳过规则过滤
-  │    │    └─ 根据 Fix PR 状态决策 → 可能 dispatch run-ci-fix-phase
-  │    └─ （若 Fix PR ci_successful）→ 评论原始 PR + 更新知识库
-  └─ 输出本次处理统计
-```
+```mermaid
+sequenceDiagram
+    participant Cron as schedule / workflow_dispatch
+    participant Mon as stream-pr-events.yml
+    participant API as 平台 API（GitHub/GitCode）
+    participant KB as 知识库（main 分支）
 
-#### workflow 2：pr-ci-fix-trigger.yml（修复链路，dispatch 触发）
-
-```
-trigger: repository_dispatch [run-ci-fix-phase]
-  │
-  ├─ Job: ci-log-analysis (phase=ci-log-analysis)
-  │    ├─ checkout source-repo
-  │    ├─ 安装 AI Agent（OpenCode 或 Claude Code）
-  │    ├─ discover_conventions.py → source-conventions.md
-  │    ├─ ci-log-analysis.py:
-  │    │    ├─ 获取 PR diff
-  │    │    ├─ 获取 CI 失败日志（逐行解析、过滤、架构优先）
-  │    │    ├─ 读取知识库
-  │    │    ├─ run_agent(ci-failure-analyst) → ci-analysis.md
-  │    │    ├─ 写入 ci-fix-log 分支
-  │    │    └─ dispatch code-fix
-  │    └─
-  │
-  └─ Job: code-fix (phase=code-fix)
-       ├─ checkout source-repo → fix 分支
-       ├─ 安装 AI Agent
-       ├─ code-fix.py:
-       │    ├─ 从 ci-fix-log 分支读取 ci-analysis.md
-       │    ├─ 获取 PR 涉及文件列表
-       │    ├─ run_agent(code-fixer) → code-fix-summary.md
-       │    ├─ 清理 AI 工具产物
-       │    ├─ git stage（只允许 PR 文件）→ git commit
-       │    └─ 写入 code-fix-summary 到 ci-fix-log 分支
-       ├─ push fix 分支
-       └─ 创建或更新 Fix PR
+    Cron->>Mon: 触发
+    Mon->>Mon: 读取 watchlist.json
+    loop 每个 watched_repo
+        Mon->>API: 获取 ci_failed 状态的 PR 列表
+        API-->>Mon: PR 列表
+        loop 每条 PR
+            Mon->>Mon: 跳过规则过滤（预发布/fix:前缀/已有成功修复）
+            Mon->>Mon: Fix PR 状态机决策
+            alt 需要触发修复
+                Mon->>Mon: dispatch run-ci-fix-phase
+            else Fix PR 已 ci_successful
+                Mon->>API: 评论原始 PR，提示 review
+                Mon->>KB: 追加修复模式案例
+            end
+        end
+    end
+    Mon-->>Cron: 输出本次处理统计
 ```
 
-#### workflow 3：sync-poll-interval.yml（配置同步，push 触发）
+#### 2.3.2 workflow 2：pr-ci-fix-trigger.yml（修复链路，dispatch 触发）
 
+```mermaid
+sequenceDiagram
+    participant D as repository_dispatch
+    participant J1 as Job: ci-log-analysis
+    participant Analyst as AI Agent（ci-failure-analyst）
+    participant API as 平台 API
+    participant Data as ci-fix-log 分支
+    participant J2 as Job: code-fix
+    participant Fixer as AI Agent（code-fixer）
+    participant Repo as 源仓库 / Fix PR
+
+    D->>J1: run-ci-fix-phase（phase=ci-log-analysis）
+    J1->>Repo: checkout source-repo
+    J1->>J1: discover_conventions.py → source-conventions.md
+    J1->>API: 获取 PR diff
+    J1->>API: 获取 CI 失败日志（逐行解析、过滤、架构优先、末尾 500 行）
+    API-->>J1: diff + 日志
+    J1->>Data: 读取历史知识库
+    J1->>Analyst: run_agent(context)
+    Analyst-->>J1: ci-analysis.md
+    J1->>Data: 写入 ci-fix-log/{pr}/ci-analysis.md
+    J1->>D: dispatch code-fix
+
+    D->>J2: run-ci-fix-phase（phase=code-fix）
+    J2->>Repo: checkout source-repo → fix 分支
+    J2->>Data: 读取 ci-analysis.md
+    J2->>API: 获取 PR 涉及文件列表
+    J2->>Fixer: run_agent(context)
+    Fixer-->>J2: code-fix-summary.md
+    J2->>J2: 清理 AI 工具产物
+    J2->>J2: git add（仅 PR 文件白名单）→ git commit
+    J2->>Repo: push fix 分支
+    J2->>Repo: 创建或更新 Fix PR
+    J2->>Data: 写入 code-fix-summary.md
 ```
-trigger: push to main，watchlist.json 变更时
-  │
-  ├─ sync_poll_interval.py:
-  │    ├─ 读取 watchlist.json 中 poll_interval_minutes
-  │    ├─ 计算对应 cron 表达式
-  │    └─ 更新 stream-pr-events.yml 中的 cron 配置
-  └─ git commit + push（若有变更）
+
+#### 2.3.3 workflow 3：sync-poll-interval.yml（配置同步，push 触发）
+
+```mermaid
+sequenceDiagram
+    participant Push as push to main（watchlist.json 变更）
+    participant Sync as sync_poll_interval.py
+    participant WF as stream-pr-events.yml
+
+    Push->>Sync: 触发
+    Sync->>Sync: 读取 watchlist.json 中 poll_interval_minutes
+    Sync->>Sync: 计算对应 cron 表达式
+    Sync->>WF: 更新 cron 配置
+    Sync->>Sync: git commit + push（若有变更）
 ```
+
+#### 2.3.4 并发控制策略
+
+| 场景 | 并发方式 | 限制 |
+|------|---------|------|
+| **监控轮询** | 单次运行顺序遍历 watched_repo | `max_events_per_run`（默认 50）防止超时 |
+| **两阶段修复** | ci-log-analysis 与 code-fix 各自独立计入 concurrency group | 避免分析和修复互相阻塞 |
+| **Fix PR 重试** | 向同一 fix 分支追加 commit，不新建 PR | commit count ≥ 6 自动关闭并转人工 |
+| **诊断报告传递** | 经 ci-fix-log 分支落盘，不经 dispatch payload | 规避 repository_dispatch ~65KB 载荷上限 |
 
 ### 2.4 物理视图（Physical View）
 
 所有计算在 GitHub Actions 的 `ubuntu-latest` Runner 上执行，无需独立服务器：
 
+```mermaid
+flowchart TB
+    subgraph RUNNER["GitHub Actions Runner（ubuntu-latest）"]
+        direction TB
+        RT1["Python 3.11<br>requests · pytest"]
+        RT2["Node.js（npm install -g）<br>opencode-ai / @anthropic-ai/claude-code"]
+        RT3["git<br>source-repo checkout · fix 分支 push"]
+    end
+
+    subgraph GH["GitHub API"]
+        GH1["ci-fix-log 分支读写"]
+        GH2["main 分支读写（知识库）"]
+        GH3["Fix PR 创建 / 评论 / label"]
+    end
+
+    subgraph GC["GitCode API"]
+        GC1["v5（Gitee-compatible）<br>PR 读写 · 评论 · label"]
+        GC2["v4（GitLab-compatible）<br>Pipeline / Job 日志"]
+        GC3["Jenkins 日志 HTTP"]
+    end
+
+    subgraph AI["AI 模型服务"]
+        AI1["OpenCode（OpenAI 兼容）"]
+        AI2["Claude.ai（OAuth）"]
+    end
+
+    RUNNER -->|"HTTPS"| GH
+    RUNNER -->|"HTTPS"| GC
+    RUNNER -->|"HTTPS"| AI
 ```
-┌─────────────────────────────────────────────────────────────┐
-│               GitHub Actions Runner (ubuntu-latest)          │
-│                                                             │
-│  ┌──────────────┐  ┌────────────────────────────────────┐  │
-│  │  Python 3.11 │  │  Node.js (npm install -g)           │  │
-│  │  requests    │  │  opencode-ai / @anthropic-ai/       │  │
-│  │  pytest      │  │  claude-code                       │  │
-│  └──────────────┘  └────────────────────────────────────┘  │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  git (source-repo checkout, fix branch push)          │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-          │                          │
-          ↓                          ↓
-┌──────────────────┐      ┌────────────────────────────────┐
-│ GitHub API       │      │ GitCode API                    │
-│ (ci-fix-log 分支  │      │ v5 (PR 读写、评论、label)        │
-│  main 分支读写)   │      │ v4 (Pipeline / Job 日志)        │
-│ (Fix PR 创建)     │      │ Jenkins 日志 HTTP              │
-└──────────────────┘      └────────────────────────────────┘
-          │
-          ↓
-┌─────────────────────────┐
-│ AI 模型服务              │
-│ OpenCode（OpenAI 兼容）  │
-│ 或 Claude.ai（OAuth）    │
-└─────────────────────────┘
-```
+
+**部署说明：**
+
+| 组件 | 位置 | 说明 |
+|------|------|------|
+| **运行时** | GitHub Actions `ubuntu-latest` Runner | 每次 workflow 触发即分配新实例，用后即焚 |
+| **AI 后端凭证** | GitHub Secrets，运行时注入 | `AI_API_KEY` / `CLAUDE_CREDENTIALS_JSON` |
+| **诊断与修复产物** | `ci-fix-log` 分支 | 通过 GitHub Contents API 读写，无需 git clone |
+| **知识库** | `main` 分支 `docs/ci-failure-patterns.md` | 随 Fix PR 验证通过增量追加 |
 
 ### 2.5 场景视图（Scenarios）
 

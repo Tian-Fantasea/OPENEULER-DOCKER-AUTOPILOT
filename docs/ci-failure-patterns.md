@@ -29,6 +29,7 @@ Dockerfile:12
 - PR #2265: `Others/netty/4.2.13` — Maven 3.9.14 在 CDN 404 → 换华为云镜像站
 - PR #2100: `Others/netty/4.2.12` — Maven 3.9.12 在 CDN 404 → 升级到 3.9.14
 - PR #1884: `Others/netty/4.2.10` — Maven 3.9.11 在 CDN 404 → 升级到 3.9.12，文件名改用变量
+- PR #2926: `Others/spring-framework/7.0.3/24.03-lts-sp4/Dockerfile` — Maven 3.9.12 从 `dlcdn.apache.org` CDN 下架导致下载 404，将下载源替换为 Apa
 
 ---
 
@@ -581,3 +582,45 @@ RUN sed -i 's/#define HAS_RGBTOUVMATRIXROW_NEON/\/\/#define HAS_RGBTOUVMATRIXROW
 
 **历史案例**:
 - PR #2751: `Cloud/openvelinux/velinux/1.0 velinux2/24.03-lts-sp3/Dockerfile` — 将 `velinux/1.0+velinux2` 版本目录从三级扁平化为二级，使其符合 CI 校验要求的 `{image
+
+---
+
+## 模式30：架构不匹配（meta缺失arch约束）
+
+**症状关键词**: does not have a compatible architecture, x86_64, aarch64, intel-basekit
+
+**根因**: - 失败位置: `AI/oneapi-basekit/2024.2.0/24.03-lts-sp4/Dockerfile:30`（`yum install` 步骤）
+- 失败原因: CI 在 aarch64 runner（`ecs-build-docker-aarch64-01-sp`）上构建该 Dockerfile，但 Intel oneAPI / GPU 仓库（配置为 RHEL x86_64 源）仅提供 x86_64 架构的 RPM 包（如 `intel-basekit-2025.3.2-19.x86_64`、`intel-opencl-...x86_64`），yum 在 aarch64 
+
+**修复方法**: `meta.yml` 中新增的 `2024.2.0-oe2403sp4` 条目缺少 `arch: x86_64` 约束，导致 CI 将该镜像调度到 aarch64 runner 上构建失败。
+
+**历史案例**:
+- PR #3135: `AI/oneapi-basekit/meta.yml` — `meta.yml` 中新增的 `2024.2.0-oe2403sp4` 条目缺少 `arch: x86_64` 约束，
+
+---
+
+## 模式31：架构不匹配
+
+**症状关键词**: does not have a compatible architecture, x86_64 on aarch64, oneAPI, yum install
+
+**根因**: - 失败位置: `AI/oneapi-runtime/2024.2.0/24.03-lts-sp4/Dockerfile:30`
+- 失败原因: 新增 Dockerfile 对应的 `meta.yml` 条目未设置 `arch: x86_64`，导致 CI 在 aarch64 节点上也尝试构建该镜像。而 Intel oneAPI 仓库和 Intel GPU 驱动仓库均只提供 x86_64 架构的 RPM 包，在 aarch64 上 yum 无法安装，报 "does not have a compatible architecture"。
+
+**修复方法**: 新增的 `2024.2.0-oe2403sp4` 镜像条目缺少 `arch: x86_64` 架构限制，导致 CI 在 aarch64 节点上也尝试构建该镜像，Intel oneAPI 包仅支持 x86_64 而安装失败。
+
+**历史案例**:
+- PR #3136: `AI/oneapi-runtime/meta.yml` — 新增的 `2024.2.0-oe2403sp4` 镜像条目缺少 `arch: x86_64` 架构限制，导致 CI 在 
+
+---
+
+## 模式32：Git快照返回HTML
+
+**症状关键词**: `gzip: stdin: not in gzip format`, `text/html`, `saved [2090]`, `git.kernel.org`, `snapshot`
+
+**根因**: - 失败位置: `Others/bcache/1.1/24.03-lts-sp4/Dockerfile:20`（wget + tar 步骤）
+- 失败原因: `wget` 请求 `git.kernel.org` 的 snapshot URL（`bcache-tools-1.1.tar.gz`），服务器返回 `text/html` 内容（仅 2090 字节的 HTML 页面）而非 gzip 压缩包，`tar -zxvf` 解压时报 `not in gzip format`。
+
+**修复方法**: `git.kernel.org` 的 Anubis 反爬保护导致 `wget` 下载 snapshot tar.gz 时返回 HTML 页面而非 gzip 压缩包，构建失败。
+
+**历史案例**:
+- PR #2929: `Others/bcache/1.1/24.03-lts-sp4/Dockerfile` — `git.kernel.org` 的 Anubis 反爬保护导致 `wget` 下载 snapshot tar.gz 时
