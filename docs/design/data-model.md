@@ -19,6 +19,7 @@
 9. [Fix PR 标题与正文规范](#9-fix-pr-标题与正文规范)
 10. [环境变量一览](#10-环境变量一览)
 11. [数据流依赖关系](#11-数据流依赖关系)
+12. [Issue 监控与镜像创建数据结构](#12-issue-监控与镜像创建数据结构)
 
 ---
 
@@ -33,8 +34,10 @@
 | **ci-fix-log 分支** | `{workflow_repo}/ci-fix-log/` | per-PR 诊断报告、修复摘要、通知状态 | 全自动（由工作流写入） |
 | **main 分支（知识库）** | `{workflow_repo}/docs/ci-failure-patterns.md` | 跨 PR 共享的失败模式知识库 | 自动追加（Fix PR 通过 CI 后触发） |
 | **main 分支（配置）** | `{workflow_repo}/config/watchlist.json` | 监控仓库列表与轮询参数 | 手动维护 |
+| **main 分支（配置）** | `{workflow_repo}/config/issue-watchlist.json` | 镜像创建：监控仓库列表与触发关键词 | 手动维护 |
+| **main 分支（state）** | `{workflow_repo}/state/dispatched_issues.json` | 镜像创建：已 dispatch 的 issue 号去重状态 | 全自动（由 workflow 层 `git commit` 写入，非 Contents API） |
 
-所有文件读写通过 **GitHub Contents API** 完成，无需 git clone workflow 仓库。
+CI 修复子系统的文件读写通过 **GitHub Contents API** 完成，无需 git clone workflow 仓库；镜像创建子系统的 `dispatched_issues.json` 例外——它由 `watch-issues.yml` 在 checkout 后直接 `git commit + push`（见 [12.2](#122-state-dispatched_issuesjson)）。
 
 ### 1.2 文件清单
 
@@ -45,6 +48,9 @@
 | `code-fix-summary.md` | `ci-fix-log` 分支 `ci-fix-log/{pr_number}/` | 持久（per-PR） | 全自动 |
 | `fix-notified` | `ci-fix-log` 分支 `ci-fix-log/{pr_number}/` | 持久（per-PR） | 全自动 |
 | `ci-failure-patterns.md` | `main` 分支 `docs/` | 持久（累积追加） | 自动（CI 验证后） |
+| `issue-watchlist.json` | `main` 分支 `config/` | 持久（手动更新） | 手动 |
+| `dispatched_issues.json` | `main` 分支 `state/` | 持久（累积追加，按仓库分组） | 全自动 |
+| `ai-result.json` | 运行时工作目录 `{image_repo_dir}/` | 临时（单次 Job 内，不提交到任何分支） | 全自动 |
 
 ### 1.3 命名约定
 
@@ -437,13 +443,17 @@ main/
 ├── .github/
 │   ├── agents/
 │   │   ├── ci-failure-analyst.md
-│   │   └── code-fixer.md
+│   │   ├── code-fixer.md
+│   │   └── image-creator.md
 │   └── workflows/
 │       ├── stream-pr-events.yml
 │       ├── pr-ci-fix-trigger.yml
-│       └── sync-poll-interval.yml
+│       ├── sync-poll-interval.yml
+│       ├── watch-issues.yml
+│       └── create-image-trigger.yml
 ├── config/
-│   └── watchlist.json         ← 监控配置（手动维护）
+│   ├── watchlist.json         ← CI 修复监控配置（手动维护）
+│   └── issue-watchlist.json   ← 镜像创建监控配置（手动维护）
 ├── docs/
 │   ├── ci-failure-patterns.md ← 知识库（自动追加）
 │   └── design/
@@ -452,6 +462,8 @@ main/
 │       └── data-model.md
 ├── scripts/
 │   └── ...
+├── state/
+│   └── dispatched_issues.json ← 镜像创建去重状态（自动追加）
 └── tests/
     └── ...
 ```
@@ -553,6 +565,24 @@ fix: {软件名} {版本号} (fix #{原始PR号})
 | `DISPATCH_TOKEN` | Secret DISPATCH_TOKEN | repository_dispatch 认证 |
 | `GITCODE_TOKEN` | Secret GITCODE_TOKEN | GitCode API 认证 |
 
+### 10.4 工作流运行时环境变量（create-image-trigger.yml 注入）
+
+| 变量 | 来源 | 说明 |
+|------|------|------|
+| `PACKAGE_NAME` | client_payload | 软件包名称 |
+| `SOURCE_REPO_URL` | client_payload | 上游源码仓库（GitHub） |
+| `DOMAIN` | client_payload | 所属领域（原始文本） |
+| `CATEGORY` | client_payload | 目标分类目录（已由 `process_issue_events.py` 映射） |
+| `SOURCE_REPO` | client_payload | 目标仓库（issue 所在仓库） |
+| `FORK_REPO` | client_payload | Fork 仓库路径 |
+| `BASE_BRANCH` | client_payload | Fork PR 的 base 分支 |
+| `ISSUE_NUMBER` | client_payload | 触发的原始 issue 编号 |
+| `DONE_LABEL` / `CREATING_LABEL` | client_payload | 完成 / 进行中 label（可在 issue-watchlist.json 中配置） |
+| `OS_VERSION` / `OS_TAG` | Variables | openEuler 版本与镜像 Tag 后缀，默认 `24.03-lts-sp3` / `oe2403sp3` |
+| `IMAGE_REPO_DIR` | workflow 层拼接 | 已克隆的 Fork 仓库本地路径 |
+| `GITCODE_TOKEN` | Secret GITCODE_TOKEN | clone/push/建 PR/评论 认证 |
+| `GH_TOKEN` | Secret DISPATCH_TOKEN | image-creator Agent 通过 `gh` CLI 查询上游 GitHub 仓库时使用 |
+
 ---
 
 ## 11. 数据流依赖关系
@@ -591,3 +621,175 @@ watchlist.json（手动维护）
                       ├─ 写: ci-fix-log/{pr_number}/fix-notified（ci-fix-log 分支）
                       └─ 写: docs/ci-failure-patterns.md（追加模式，main 分支）
 ```
+
+**镜像创建子系统（独立数据流，不与上述流程交叉）：**
+
+```
+issue-watchlist.json（手动维护）
+    │
+    └─▶ process_issue_events.py（Issue 监控，小时级轮询）
+              │
+              ├─ 读: state/dispatched_issues.json（去重）
+              ├─ 读: GitCode open issues（gitcode_issues_api.py）
+              ├─ 写: state/dispatched_issues.json（新增已 dispatch 的 issue 号，main 分支 git commit）
+              │
+              └─ dispatch create-image
+                        │
+                        ▼
+               create-image.py
+                  ├─ 读: 上游软件源码仓库（GitHub，只读）
+                  ├─ 读: Fork 仓库内同分类目录的参考包
+                  ├─ 写: {image_repo_dir}/ai-result.json（运行时临时文件）
+                  ├─ 写: Fork 仓库 add-{package_name} 分支（git commit + push）
+                  ├─ 写: Fork 仓库 Pull Request（平台 API 创建）
+                  └─ 写: 原始 issue 评论 + label（gitcode_issues_api.py）
+```
+
+---
+
+## 12. Issue 监控与镜像创建数据结构
+
+### 12.1 issue-watchlist.json
+
+**路径：** `config/issue-watchlist.json`（`main` 分支）
+
+**用途：** 定义镜像创建流水线监控的仓库列表和触发行为，`watch-issues.yml` 每次运行时读取。
+
+```json
+{
+  "watched_repos": [
+    {
+      "repo": "https://gitcode.com/openeuler/openeuler-docker-images",
+      "fork_repo": "sunshuang1866/openeuler-docker-images",
+      "base_branch": "master",
+      "trigger_title_keyword": "【new-image】",
+      "creating_label": "image-creating",
+      "done_label": "image-created",
+      "enabled": false,
+      "description": "openEuler 官方容器镜像仓库，自动为新增上游软件包创建 Dockerfile 和 PR"
+    }
+  ],
+  "settings": {
+    "poll_interval_hours": 1,
+    "max_events_per_run": 5
+  }
+}
+```
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|:---:|------|
+| `repo` | string (URL) | ✅ | 目标仓库（issue 所在仓库） |
+| `fork_repo` | string | ✅ | 用于创建镜像文件 PR 的 Fork 仓库路径 |
+| `base_branch` | string | ✅ | Fork PR 的 base 分支，默认 `master` |
+| `trigger_title_keyword` | string | ✅ | 触发关键词，默认 `【new-image】`（大小写不敏感匹配） |
+| `creating_label` | string | ❌ | 处理中 label，默认 `image-creating` |
+| `done_label` | string | ❌ | 完成 label，默认 `image-created` |
+| `enabled` | boolean | ✅ | `false` 时完全跳过该仓库 |
+| `description` | string | ❌ | 仅供人类阅读 |
+| `settings.poll_interval_hours` | integer | ✅ | 轮询间隔（小时），当前固定写入 cron，无自动同步机制（与 `watchlist.json` 的分钟级配置不同） |
+| `settings.max_events_per_run` | integer | ✅ | 每次运行最多处理的 issue 数量 |
+
+### 12.2 state/dispatched_issues.json
+
+**路径：** `state/dispatched_issues.json`（`main` 分支）
+
+**用途：** 记录已 dispatch 过 create-image 的 issue 号，按仓库 URL 分组，防止同一 issue 被重复触发。
+
+```json
+{
+  "https://gitcode.com/openeuler/openeuler-docker-images": ["64", "65"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| key | string (仓库 URL) | 与 `issue-watchlist.json` 中的 `repo` 对应 |
+| value | string[] | 已 dispatch 的 issue 号列表（字符串形式） |
+
+**与 ci-fix-log 分支状态文件的关键差异：**
+
+| 维度 | `ci-fix-log/{pr}/fix-notified` | `state/dispatched_issues.json` |
+|------|--------------------------------|--------------------------------|
+| 存储分支 | `ci-fix-log`（独立数据分支） | `main`（与源码同分支） |
+| 写入方式 | GitHub Contents API（单文件读写） | workflow 层 `git add` + `git commit` + `git push` |
+| 粒度 | 每 PR 一个标记文件 | 单个 JSON 文件，全仓库共享 |
+| 去重维度 | 是否已通知维护者（终态标记） | 是否已 dispatch 过（一次性触发标记，不代表处理结果） |
+
+### 12.3 create-image repository_dispatch payload
+
+**类型：** GitHub repository_dispatch，event_type 为 `create-image`。
+
+```json
+{
+  "event_type": "create-image",
+  "client_payload": {
+    "repo": "https://gitcode.com/openeuler/openeuler-docker-images",
+    "fork_repo": "sunshuang1866/openeuler-docker-images",
+    "base_branch": "master",
+    "issue_number": "88",
+    "package_name": "fluid",
+    "source_repo_url": "https://github.com/fluid-cloudnative/fluid",
+    "domain": "云原生",
+    "category": "Cloud",
+    "creating_label": "image-creating",
+    "done_label": "image-created"
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `repo` | string (URL) | issue 所在的目标仓库 |
+| `fork_repo` | string | 用于提交镜像文件的 Fork 仓库 |
+| `base_branch` | string | Fork PR 的 base 分支 |
+| `issue_number` | string | 触发该次创建的原始 issue 编号 |
+| `package_name` | string | 软件包名称（`parse_issue_body` 解析得出，或从 URL fallback） |
+| `source_repo_url` | string | 上游源码仓库（当前仅支持 GitHub） |
+| `domain` | string | 原始领域文本（未归一化） |
+| `category` | string | 已归一化的目标分类目录 |
+| `creating_label` / `done_label` | string | 处理中 / 完成 label |
+
+### 12.4 ai-result.json
+
+**路径：** `{image_repo_dir}/ai-result.json`（Fork 仓库工作目录内，**运行时临时文件，不提交到任何分支**）
+
+**生成者：** `image-creator` Agent（由 `create-image.py` 驱动）
+
+**用途：** 向 `create-image.py` 和后续 workflow 步骤传递创建结果，决定是否执行 commit/push/建 PR。
+
+```json
+{
+  "success": true,
+  "package_name": "fluid",
+  "version": "1.0.8",
+  "category": "Cloud",
+  "tag": "1.0.8-oe2403sp3",
+  "files_created": [
+    "Cloud/fluid/1.0.8/24.03-lts-sp3/Dockerfile",
+    "Cloud/fluid/meta.yml",
+    "Cloud/fluid/README.md",
+    "Cloud/fluid/doc/image-info.yml",
+    "Cloud/fluid/doc/picture/logo.png"
+  ],
+  "image_list_updated": "Cloud/image-list.yml",
+  "error": null
+}
+```
+
+失败时：
+
+```json
+{
+  "success": false,
+  "package_name": "fluid",
+  "error": "无法确定上游最新版本号"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `success` | boolean | 是否成功生成全部文件 |
+| `package_name` / `version` / `category` / `tag` | string | 供 workflow 拼接 commit message、PR 标题、branch 名 |
+| `files_created` | string[] | 本次创建的全部文件路径，供人工审查 |
+| `image_list_updated` | string | 被更新的 `image-list.yml` 路径 |
+| `error` | string \| null | 失败原因；`success=false` 时必填 |

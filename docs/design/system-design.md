@@ -21,6 +21,8 @@
    - [3.3 AI Agent 层](#33-ai-agent-层)
    - [3.4 平台抽象层](#34-平台抽象层)
    - [3.5 数据持久层](#35-数据持久层)
+   - [3.6 Issue 监控层](#36-issue-监控层)
+   - [3.7 镜像创建层](#37-镜像创建层)
 4. [关键设计决策](#四关键设计决策)
 5. [安全设计](#五安全设计)
 6. [性能设计](#六性能设计)
@@ -31,19 +33,28 @@
 
 ## 一、系统概述
 
-docker-images-workflow 是一套面向容器镜像仓库的 **CI 失败自动修复流水线**，以 GitHub Actions 作为编排引擎，以 AI 大模型（DeepSeek / Claude 等）作为诊断和修复执行者。
+docker-images-workflow 是一套面向容器镜像仓库的自动化工作流集合，以 GitHub Actions 作为编排引擎，以 AI 大模型（DeepSeek / Claude 等）作为执行者，包含两条相互独立、并行运行的流水线：
+
+| 子系统 | 触发方式 | 职责 |
+|--------|---------|------|
+| **CI 修复流水线** | 轮询目标仓库 `ci_failed` 标签的 PR | 诊断 CI 失败根因并自动提交修复 PR |
+| **镜像创建流水线** | 轮询目标仓库带「【new-image】」关键词的 Issue | 为新增上游软件包自动生成 Dockerfile 等镜像文件并提交 PR |
+
+两条流水线共用同一套 AI Agent 调度层（`ai_runner.py`），但各自拥有独立的触发配置、平台 API 封装和角色 Prompt，互不干扰。
 
 ### 1.1 设计原则
 
 | 原则 | 说明 |
 |------|------|
-| **两阶段分离** | 诊断（ci-log-analysis）和修复（code-fix）各自独立运行，通过 ci-data 分支传递数据，互不耦合 |
-| **配置驱动** | `watchlist.json` 控制监控目标和轮询参数，无需修改 workflow 文件即可扩展 |
-| **平台无关** | 阶段脚本通过工厂层调用平台 API，业务逻辑不感知 GitCode/GitHub 的差异 |
+| **两阶段分离** | CI 修复的诊断（ci-log-analysis）和修复（code-fix）各自独立运行，通过 ci-fix-log 分支传递数据，互不耦合 |
+| **配置驱动** | `watchlist.json` / `issue-watchlist.json` 控制监控目标和轮询参数，无需修改 workflow 文件即可扩展 |
+| **平台无关** | CI 修复阶段脚本通过工厂层调用平台 API，业务逻辑不感知 GitCode/GitHub 的差异 |
 | **知识反馈** | Fix PR 通过 CI 验证后，修复模式自动写入知识库，下次同类失败置信度显著提升 |
 | **自管理生命周期** | Fix PR 从创建到通过或关闭，全程由工作流自主管理，无需人工干预修复中间状态 |
 | **最小化修改** | AI 修复工程师严格限定只修改原始 PR 涉及的文件，不引入范围外改动 |
 | **证据驱动** | 诊断报告的每个结论必须有日志依据；日志显示成功时，强制判定为证据不足，不做强行分析 |
+| **只新增不改动** | 镜像创建 Agent 严格限定只创建新文件，不修改仓库内已有软件包的任何文件 |
+| **AI 调度层复用** | CI 修复与镜像创建共用 `ai_runner.py` 的多后端调度能力，避免重复实现 OpenCode/Claude Code 封装 |
 
 ### 1.2 核心能力一览
 
@@ -55,6 +66,8 @@ docker-images-workflow 是一套面向容器镜像仓库的 **CI 失败自动修
 | 多平台支持 | URL 识别平台，API 层完全隔离（GitCode v5/v4 + GitHub REST） |
 | 多 AI 后端 | 通过 `AI_RUNNER` 变量切换 OpenCode 和 Claude Code，接口统一 |
 | 智能跳过 | 预发布版本正则过滤 + Fix PR 标题过滤 + 已有成功修复检测 |
+| Issue 驱动建包 | 解析 Issue 标题/正文提取软件包名、源码仓库、所属领域，自动映射到目标分类目录 |
+| 镜像文件自动生成 | AI Agent 按仓库规范生成 Dockerfile / meta.yml / README / image-info.yml / logo，并更新分类索引 |
 
 ---
 
@@ -72,7 +85,9 @@ docker-images-workflow 是一套面向容器镜像仓库的 **CI 失败自动修
 
 ### 2.1 逻辑视图（Logical View）
 
-系统按职责分为五层：
+系统包含两条并行的逻辑流水线：CI 修复流水线和镜像创建流水线，前者按职责分为五层，后者复用其中的 AI Agent 调度层。
+
+#### 2.1.1 CI 修复子系统
 
 ```mermaid
 flowchart TD
@@ -141,6 +156,62 @@ flowchart TD
 | **平台抽象层** | 屏蔽 GitHub / GitCode 平台差异，统一 API 接口 | `ci_api.py` 工厂 + `ci_github_api.py` + `ci_gitcode_api.py` |
 | **数据持久层** | 诊断报告、修复摘要、知识库的持久化读写 | `ci-fix-log` 分支 + `main` 分支 `ci_data.py` |
 
+#### 2.1.2 镜像创建子系统
+
+```mermaid
+flowchart TD
+    subgraph ISSUEWATCH["Issue 监控层 Issue Watch"]
+        IW1["watch-issues.yml<br>cron 每小时轮询"]
+        IW2["issue-watchlist.json<br>监控仓库 + 触发关键词 + label"]
+        IW3["process_issue_events.py<br>拉取 → 过滤 → 解析 → 去重 → dispatch"]
+        IW4[("state/dispatched_issues.json<br>已 dispatch 的 issue 号")]
+    end
+
+    subgraph ISSUEAPI["Issue API"]
+        IA1["gitcode_issues_api.py<br>fetch_all_open_issues<br>parse_issue_body<br>add_issue_comment / label"]
+    end
+
+    subgraph IMGPIPE["镜像创建执行层 Pipeline"]
+        IC1["create-image-trigger.yml"]
+        IC2["Job: create-image<br>scripts/stages/create-image.py"]
+        IC1 --> IC2
+    end
+
+    subgraph IMGAGENT["AI Agent（复用调度层）"]
+        IAG1["image-creator.md<br>镜像创建专家角色"]
+        IAG2["ai_runner.py<br>与 CI 修复子系统共用"]
+        IAG2 -.-> IAG1
+    end
+
+    subgraph EXTERNAL["外部资源"]
+        EX1[("上游软件源码仓库<br>GitHub（只读）")]
+        EX2[("openeuler-docker-images<br>Fork 仓库（GitCode）")]
+        EX3[("目标仓库 Issue<br>GitCode")]
+    end
+
+    IW2 --> IW1
+    IW1 --> IW3
+    IW3 -->|"查询 + 过滤 open issues"| IA1
+    IA1 -->|"读写"| EX3
+    IW3 -->|"读/写去重状态"| IW4
+    IW3 -->|"repository_dispatch<br>create-image"| IC1
+
+    IC2 -->|"git clone"| EX2
+    IC2 -->|"调度生成"| IAG2
+    IC2 -->|"研究上游 release / README / go.mod"| EX1
+    IC2 -->|"commit + push + 建 PR"| EX2
+    IC2 -->|"评论 + 打 label"| IA1
+```
+
+**功能分层说明：**
+
+| 层级 | 职责 | 核心组件 |
+|------|------|---------|
+| **Issue 监控层** | 定时轮询 Issue，按关键词过滤，解析正文，按 issue 号去重后 dispatch | `watch-issues.yml` + `issue-watchlist.json` + `process_issue_events.py` |
+| **Issue API** | GitCode Issue 的查询、正文解析、评论、打标签 | `gitcode_issues_api.py` |
+| **镜像创建执行层** | 单 Job 完成 clone → AI 生成文件 → commit/push → 建 PR → 评论回写 | `create-image-trigger.yml`（Job: create-image） |
+| **AI Agent** | 镜像创建专家角色定义 + 复用 CI 修复子系统的多后端调度 | `image-creator.md` + `ai_runner.py` |
+
 ### 2.2 开发视图（Development View）
 
 ```
@@ -148,34 +219,43 @@ docker-images-workflow/
 ├── .github/
 │   ├── agents/
 │   │   ├── ci-failure-analyst.md   # AI Agent Prompt：诊断师角色定义
-│   │   └── code-fixer.md           # AI Agent Prompt：修复工程师角色定义
+│   │   ├── code-fixer.md           # AI Agent Prompt：修复工程师角色定义
+│   │   └── image-creator.md        # AI Agent Prompt：镜像创建专家角色定义
 │   └── workflows/
 │       ├── stream-pr-events.yml    # 监控 cron（间隔由 watchlist 控制）
 │       ├── pr-ci-fix-trigger.yml   # 两阶段修复链路（repository_dispatch 触发）
-│       └── sync-poll-interval.yml  # watchlist 变更时同步 cron 表达式
+│       ├── sync-poll-interval.yml  # watchlist 变更时同步 cron 表达式
+│       ├── watch-issues.yml        # Issue 监控 cron（每小时轮询）
+│       └── create-image-trigger.yml # 镜像创建链路（repository_dispatch 触发）
 ├── config/
-│   └── watchlist.json              # 监控仓库列表与轮询配置
+│   ├── watchlist.json              # 监控仓库列表与轮询配置（CI 修复）
+│   └── issue-watchlist.json        # 监控仓库列表与触发关键词（镜像创建）
 ├── docs/
 │   ├── ci-failure-patterns.md      # 历史失败模式知识库（自动维护，main 分支）
 │   └── design/                     # 设计文档
 ├── scripts/
 │   ├── lib/
-│   │   ├── ai_runner.py            # AI 后端统一入口（按 AI_RUNNER 分发）
+│   │   ├── ai_runner.py            # AI 后端统一入口（按 AI_RUNNER 分发，两条流水线共用）
 │   │   ├── opencode_run.py         # OpenCode 后端封装
 │   │   ├── claude_code_run.py      # Claude Code 后端封装
 │   │   ├── ci_api.py               # 平台工厂（detect + normalize + get_api）
 │   │   ├── ci_github_api.py        # GitHub API 封装
 │   │   ├── ci_gitcode_api.py       # GitCode API 封装（v5 PR + v4 Pipeline + Jenkins）
+│   │   ├── gitcode_issues_api.py   # GitCode Issue API 封装 + 正文解析（镜像创建专用）
 │   │   ├── ci_data.py              # 分支读写（ci-fix-log + main）
 │   │   ├── fix_pr_body.py          # Fix PR 标题与正文生成
 │   │   ├── stage_common.py         # 阶段脚本公共工具
 │   │   └── discover_conventions.py # 自动读取源仓库项目规范
 │   ├── stages/
 │   │   ├── ci-log-analysis.py      # Stage 1：CI 日志分析主逻辑
-│   │   └── code-fix.py             # Stage 2：代码修复主逻辑
+│   │   ├── code-fix.py             # Stage 2：代码修复主逻辑
+│   │   └── create-image.py         # Stage：镜像文件生成主逻辑
 │   └── watch/
 │       ├── process_pr_events.py    # PR 轮询 + dispatch 决策 + 跳过规则
-│       └── sync_poll_interval.py   # 同步 watchlist → cron 表达式
+│       ├── sync_poll_interval.py   # 同步 watchlist → cron 表达式
+│       └── process_issue_events.py # Issue 轮询 + 解析 + 去重 + dispatch
+├── state/
+│   └── dispatched_issues.json      # 已 dispatch 的 issue 号（按仓库分组去重）
 └── tests/
     ├── test_ci_gitcode_api.py      # URL 评分与日志抓取（44 用例）
     ├── test_fix_pr_body.py         # Fix PR 标题/正文生成（22 用例）
@@ -216,6 +296,18 @@ docker-images-workflow/
 │  scripts/watch/（process_pr_events）       │
 │  依赖 ci_api + ci_data.py + watchlist.json │
 └─────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────┐
+│  scripts/watch/（process_issue_events）          │
+│  依赖 gitcode_issues_api.py + issue-watchlist.json│
+│  （不依赖 ci_api.py，Issue 操作独立于 PR/CI 操作）  │
+└───────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────┐
+│  scripts/stages/（create-image）                 │
+│  依赖 ai_runner.py（与 stages/ 共用同一调度层）     │
+│  不依赖 ci_api.py / ci_data.py                   │
+└───────────────────────────────────────────────┘
 ```
 
 ### 2.3 进程视图（Process View）
@@ -311,6 +403,76 @@ sequenceDiagram
 | **两阶段修复** | ci-log-analysis 与 code-fix 各自独立计入 concurrency group | 避免分析和修复互相阻塞 |
 | **Fix PR 重试** | 向同一 fix 分支追加 commit，不新建 PR | commit count ≥ 6 自动关闭并转人工 |
 | **诊断报告传递** | 经 ci-fix-log 分支落盘，不经 dispatch payload | 规避 repository_dispatch ~65KB 载荷上限 |
+| **镜像创建** | 按 `package_name` 分组的 concurrency group（`cancel-in-progress: false`） | 同一软件包的重复 dispatch 串行排队，不同软件包并行 |
+
+#### 2.3.5 workflow 4：watch-issues.yml（Issue 监控，cron 触发）
+
+```mermaid
+sequenceDiagram
+    participant Cron as schedule（每小时）/ workflow_dispatch
+    participant Mon as process_issue_events.py
+    participant API as gitcode_issues_api.py
+    participant Issue as GitCode Issue
+    participant State as state/dispatched_issues.json
+    participant Trigger as create-image-trigger.yml
+
+    Cron->>Mon: 触发
+    Mon->>Mon: 读取 issue-watchlist.json
+    loop 每个 watched_repo（enabled=true）
+        Mon->>API: fetch_all_open_issues + 按 trigger_title_keyword 过滤
+        API->>Issue: GET open issues
+        Issue-->>API: issue 列表
+        API-->>Mon: 含关键词的 issue 列表
+        loop 每条 issue（直到 max_events_per_run）
+            Mon->>State: 检查 issue 号是否已 dispatch
+            alt 已 dispatch
+                Mon->>Mon: 跳过
+            else 未 dispatch
+                Mon->>API: parse_issue_body（提取 package_name/source_repo/domain/category）
+                alt 解析成功
+                    Mon->>Trigger: repository_dispatch [create-image]
+                    Mon->>State: 标记该 issue 号已 dispatch
+                else 解析失败（信息不足）
+                    Mon->>Mon: 跳过并记录日志
+                end
+            end
+        end
+    end
+    Mon->>State: 若有变更则写回 state 文件（workflow 层 git commit + push）
+    Mon-->>Cron: 输出本次处理统计
+```
+
+#### 2.3.6 workflow 5：create-image-trigger.yml（镜像创建，dispatch 触发）
+
+```mermaid
+sequenceDiagram
+    participant D as repository_dispatch [create-image]
+    participant Job as Job: create-image
+    participant Fork as openeuler-docker-images Fork
+    participant Stage as create-image.py
+    participant Agent as AI Agent（image-creator）
+    participant Upstream as 上游软件源码仓库（GitHub）
+    participant Issue as GitCode Issue
+
+    D->>Job: client_payload（package_name/source_repo_url/domain/category/issue_number/...）
+    Job->>Fork: git clone（浅克隆）
+    Job->>Stage: 运行 create-image.py
+    Stage->>Agent: run_agent(context, instruction)
+    Agent->>Upstream: 查询最新 release/tag、go.mod、README（gh api / curl）
+    Agent->>Fork: 研究同类参考包（同分类目录下已有 Dockerfile/meta.yml）
+    Agent->>Fork: 创建 Dockerfile / meta.yml / README.md / image-info.yml / logo
+    Agent->>Fork: 更新 {category}/image-list.yml
+    Agent-->>Stage: 写入 ai-result.json（success/package_name/version/category/tag）
+    Stage-->>Job: 输出变量（GITHUB_OUTPUT）
+
+    alt success == true
+        Job->>Job: 清理 AI 工具产物 → git add {category}/ → commit → push add-{package_name} 分支
+        Job->>Fork: 创建 Pull Request（GitCode v5 API）
+        Job->>Issue: 打 done_label（image-created） + 评论 PR 链接
+    else success == false
+        Job->>Issue: 评论失败说明 + workflow 日志链接
+    end
+```
 
 ### 2.4 物理视图（Physical View）
 
@@ -342,9 +504,14 @@ flowchart TB
         AI2["Claude.ai（OAuth）"]
     end
 
+    subgraph UPSTREAM["上游软件源码仓库（GitHub，只读）"]
+        UP1["release/tag · go.mod · README<br>（image-creator Agent 通过 gh CLI 查询）"]
+    end
+
     RUNNER -->|"HTTPS"| GH
     RUNNER -->|"HTTPS"| GC
     RUNNER -->|"HTTPS"| AI
+    RUNNER -->|"HTTPS（仅镜像创建流水线）"| UPSTREAM
 ```
 
 **部署说明：**
@@ -410,6 +577,32 @@ flowchart TB
 4. code-fix 读取报告 → 判断 infra-error → 不修改代码，输出说明摘要
 5. no_changes=true → 不创建 Fix PR
 6. 下次轮询，原始 PR 仍有 ci_failed → 再次 dispatch（等待真实日志可用）
+```
+
+#### 场景 E：新增镜像请求（镜像创建流水线）
+
+```
+1. 维护者在 openeuler-docker-images 仓库创建 issue：
+   标题："【new-image】新增 fluid 镜像"
+   正文："**软件包名称：** fluid\n**源码仓库：** https://github.com/fluid-cloudnative/fluid\n**所属领域：** 云原生"
+2. watch-issues.yml 每小时轮询 → 发现该 issue 标题含「【new-image】」
+3. process_issue_events.py:
+   - 检查 state/dispatched_issues.json，issue #88 未记录 → 未跳过
+   - parse_issue_body 解析出 package_name=fluid, source_repo_url=..., domain=云原生 → category=Cloud
+   - dispatch create-image（携带 issue_number=88）
+   - 标记 issue #88 已 dispatch，写回 state 文件
+4. create-image-trigger.yml Job:
+   - clone fork 仓库 sunshuang1866/openeuler-docker-images
+   - image-creator Agent：
+     - 查询 fluid 最新 release 版本、go.mod 中的 Go 版本
+     - 参考 Cloud/ 目录下同类 Go 项目包的 Dockerfile
+     - 创建 Cloud/fluid/{version}/24.03-lts-sp3/Dockerfile、meta.yml、README.md、doc/image-info.yml、logo
+     - 更新 Cloud/image-list.yml
+     - 写入 ai-result.json（success=true）
+   - git commit + push add-fluid 分支
+   - 创建 PR: "Feat: add fluid 1.0.8 docker image on openEuler 24.03-LTS-SP3"（Closes #88）
+   - 在 issue #88 评论 PR 链接，打 image-created label
+5. 维护者 review 该 PR，确认 Dockerfile 构建通过后合并
 ```
 
 ---
@@ -625,6 +818,99 @@ def append_pattern(pr_number, repo, analysis, fix_summary):
     write_file(KNOWLEDGE_PATH, updated, ..., branch=MAIN_BRANCH)
 ```
 
+### 3.6 Issue 监控层
+
+#### process_issue_events.py — Issue 轮询与解析
+
+与 CI 修复子系统的 `process_pr_events.py` 结构类似，但监控对象是 Issue 而非 PR，去重方式是本地 state 文件而非平台状态标签：
+
+```python
+# 1. 读取 config/issue-watchlist.json，遍历 enabled 的 watched_repos
+# 2. 拉取全部 open issues，按 trigger_title_keyword（默认「【new-image】」）过滤标题
+# 3. 用 state/dispatched_issues.json 按 issue 号去重（而非依赖仓库 label 状态）
+done_numbers = dispatched_numbers(state, repo)
+if number in done_numbers:
+    skip()
+
+# 4. 解析 issue 标题+正文，提取 package_name / source_repo_url / domain / category
+parsed = parse_issue_body(title, body)
+if not parsed:
+    skip()  # 信息不足，不 dispatch
+
+# 5. dispatch create-image，成功后标记该 issue 号已 dispatch
+if dispatch_create_image(payload, dispatch_token, target_repo):
+    mark_dispatched(state, repo, number)
+```
+
+**与 CI 修复子系统 Monitor 的关键差异：**
+
+| 维度 | CI 修复（process_pr_events.py） | 镜像创建（process_issue_events.py） |
+|------|-------------------------------|-----------------------------------|
+| 去重依据 | 平台 label 状态机（ci_successful/ci_failed/...） | 本地 state 文件（`dispatched_issues.json`），一次性触发不重试 |
+| 触发条件 | 标签匹配（`ci_failed`） | 标题关键词匹配（`【new-image】`） |
+| 决策复杂度 | 状态机（8 种状态） | 布尔去重（已 dispatch / 未 dispatch） |
+| 轮询周期 | 分钟级（`poll_interval_minutes`） | 小时级（固定 cron `0 * * * *`） |
+
+#### gitcode_issues_api.py — Issue 正文解析规则
+
+正文解析支持结构化字段（`**软件包名称：**`）和自由文本两种格式，通过多组正则按优先级尝试匹配：
+
+```python
+_PACKAGE_PATTERNS = [
+    re.compile(r'\*\*软件包名称[（(].*?[）)]?[：:]\*\*\s*(\S+)', re.IGNORECASE),
+    re.compile(r'\*\*Package Name[：:]\*\*\s*(\S+)', re.IGNORECASE),
+    # ... 逐级放宽匹配条件，最终 fallback 到从 source_repo_url 推断
+]
+```
+
+**领域 → 目录映射表（`DOMAIN_TO_CATEGORY`）：** 将 issue 中的中/英文领域描述（如"虚拟化"、"云原生"、"AI"）归一化映射到仓库的分类目录（`Cloud`/`AI`/`Bigdata`/`Database`/`HPC`/`Security`/`Storage`），未命中时默认归入 `Cloud`。
+
+### 3.7 镜像创建层
+
+#### create-image.py — 镜像文件生成主逻辑
+
+```python
+# 输入（环境变量，来自 dispatch payload）：
+# PACKAGE_NAME / SOURCE_REPO_URL / DOMAIN / CATEGORY / OS_VERSION / OS_TAG / IMAGE_REPO_DIR
+
+context = {
+    'package_name': package_name, 'source_repo_url': source_repo_url,
+    'domain': domain, 'category': category,
+    'os_version': os_version, 'os_tag': os_tag,
+    'image_repo_dir': image_repo_dir,
+}
+
+run_agent(
+    prompt_file=AGENT_PROMPT_FILE,   # .github/agents/image-creator.md
+    context=context,
+    instruction=f"在 {image_repo_dir} 下创建 Dockerfile/meta.yml/README/image-info.yml/logo，更新 image-list.yml",
+    work_dir=image_repo_dir,
+    output_file=os.path.join(image_repo_dir, 'ai-result.json'),
+)
+
+# 读取 ai-result.json，写出 GITHUB_OUTPUT 供后续 workflow 步骤（commit/push/建 PR）使用
+```
+
+与 CI 修复阶段脚本共用 `ai_runner.run_agent()`，但**不经过 `ci_api.py` 平台工厂**——因为 create-image 只需要"克隆 fork + 本地文件生成"，不需要跨平台的 PR/CI 状态查询能力。
+
+#### image-creator.md — 镜像创建专家角色
+
+**核心职责：** 研究上游软件包（版本、构建语言、License）→ 参考仓库内同类包 → 生成完整镜像文件集 → 输出结果 JSON。
+
+**关键约束：**
+
+| 约束 | 说明 |
+|------|------|
+| 只创建新文件 | 不修改仓库内任何已有软件包的文件 |
+| Dockerfile 双架构 | 必须通过 `${TARGETARCH}` 支持 amd64 + arm64，禁止硬编码架构 |
+| README 纯英文 | 不得包含任何中文字符；代码块用 TAB 缩进 |
+| image-info.yml 字段顺序固定 | `name → category → description → environment → tags → download → usage → license → similar_packages → dependency → homepage → upstream` |
+| Logo 禁止 AI 生成 | 优先从上游仓库 `docs/` 目录找官方图，逐级 fallback 到 CNCF artwork / GitHub 头像 / Pillow 占位图 |
+| 版本变量规范 | Dockerfile 中 `ARG VERSION`（全大写）默认值须与 `meta.yml` 版本键完全一致 |
+| 依赖包名映射 | Debian/Ubuntu 包名（如 `libssl-dev`）需按内置映射表转换为 openEuler RPM 包名（如 `openssl-devel`） |
+
+这些约束与 CI 修复子系统的 code-fixer（"只改 PR 文件"）在设计理念上一致：**AI 的写入范围必须被显式收窄**，避免越权修改。
+
 ---
 
 ## 四、关键设计决策
@@ -673,6 +959,15 @@ def append_pattern(pr_number, repo, analysis, fix_summary):
 - 新 commit 触发 CI 重新运行，历史记录清晰
 - 避免 PR 数量膨胀造成维护者混乱
 
+### 4.6 镜像创建复用 AI 调度层，但不复用平台 API 工厂
+
+**决策：** `create-image.py` 复用 `ai_runner.py` 的多后端调度能力，但不接入 `ci_api.py` 的平台抽象工厂，而是直接使用独立的 `gitcode_issues_api.py`。
+
+**理由：**
+- AI 后端调度（OpenCode/Claude Code 切换）是与业务无关的通用能力，两条流水线复用可避免重复实现
+- 但 `ci_api.py` 工厂封装的是"PR + CI 状态"相关接口（`get_latest_failed_run`、`find_open_ci_successful_fix_pr` 等），镜像创建流程不涉及 PR/CI 查询，只需 Issue 读写 + git clone/push，接入工厂层反而引入不必要的接口耦合
+- 镜像创建目前只支持 GitCode 一个平台，尚不存在多平台需求，独立实现更简单直接；未来如需支持 GitHub Issue，可参照 `ci_api.py` 的模式再抽象工厂层
+
 ---
 
 ## 五、安全设计
@@ -705,6 +1000,14 @@ AI_ARTIFACT_SUFFIXES = {'.pyc', '.pyo'}
 
 workflow 层额外执行 `git rm -rf --cached` 确保暂存区干净。
 
+### 5.4 镜像创建的写入范围控制
+
+镜像创建 Agent 的写入范围控制与 code-fixer 的"最小化修改"理念一致，但方向相反——**只允许新增，不允许修改**：
+
+- **Prompt 层**：image-creator 角色定义明确"只创建新文件，不修改现有包的文件"
+- **提交范围**：workflow 层 `git add ${CATEGORY}/` 只暂存目标分类目录下的变更，不会误提交仓库其他目录的历史文件
+- **凭证隔离**：镜像创建复用与 CI 修复相同的 Secrets（`GITCODE_TOKEN`、`DISPATCH_TOKEN`、AI 相关 Key），未引入额外凭证面
+
 ---
 
 ## 六、性能设计
@@ -723,6 +1026,12 @@ workflow 层额外执行 `git rm -rf --cached` 确保暂存区干净。
 
 - 所有 HTTP 请求设置 timeout（15–30s），避免网络故障导致 Job 挂起
 - ci-fix-log 分支操作通过 Contents API（单文件读写），不需要 git clone，低延迟
+
+### 6.4 镜像创建执行
+
+- Issue 监控每次运行最多处理 `max_events_per_run`（默认 5）条 issue，且轮询周期为小时级，天然低频，无需精细限流
+- 单次镜像创建 Job 超时设为 60 分钟（长于 CI 修复的 30 分钟），因需要额外的上游调研步骤（release 查询、README 分析、logo 下载）
+- 按 `package_name` 分组的 concurrency group 保证同一软件包的重复请求不并发执行，避免同一 Fork 分支被并发写入
 
 ---
 
@@ -768,6 +1077,12 @@ def create_pull_request(repo, head, base, title, body, token) -> dict: ...
 
 `poll_interval_minutes` 变更后自动触发 `sync-poll-interval.yml` 同步 cron。
 
+### 7.4 镜像创建接入新监控仓库 / 新分类
+
+**接入新监控仓库：** 仅需编辑 `config/issue-watchlist.json`，向 `watched_repos` 数组追加条目（`repo`/`fork_repo`/`trigger_title_keyword`/`creating_label`/`done_label`），无需改代码。
+
+**接入新领域分类：** 在 `gitcode_issues_api.py` 的 `DOMAIN_TO_CATEGORY` 字典中追加"领域关键词 → 目标目录"映射即可，无需改动解析逻辑或 workflow 文件。
+
 ---
 
 ## 八、技术选型
@@ -781,3 +1096,5 @@ def create_pull_request(repo, head, base, title, body, token) -> dict: ...
 | **持久化存储** | GitHub Contents API | 无需额外基础设施，利用 Git 的版本控制特性，天然支持分支隔离 |
 | **平台 API（GitCode）** | v5（Gitee-compatible）+ v4（GitLab-compatible） | 两套 API 分别覆盖 PR 管理和 CI/CD 日志获取 |
 | **测试框架** | pytest | Python 生态标准选择，参数化测试支持完善 |
+| **上游软件调研** | GitHub CLI（`gh api`） | image-creator Agent 内置工具，免于额外封装 GitHub REST 客户端 |
+| **Logo 占位生成** | Pillow | 官方 logo 获取失败时的最终 fallback，生成简单文字占位图，避免使用 AI 生成图像 |

@@ -289,6 +289,37 @@ Fix PR CI 结果
 | KB-03 | 知识库写入 main 分支的 `docs/ci-failure-patterns.md` | Must |
 | KB-04 | 已通知原始 PR 后，标记 fix-notified，避免重复通知 | Should |
 
+### 5.5 镜像创建（create-image）
+
+除 CI 失败修复外，系统还包含第二条独立流水线：为新增上游软件包**自动生成镜像文件并提交 PR**，覆盖"从 Issue 请求到镜像上线"的另一类重复性维护工作。
+
+**Issue 监控：**
+
+| 需求 ID | 需求描述 | 优先级 |
+|---------|---------|--------|
+| ISW-01 | 按小时级 cron 定时运行，扫描 `issue-watchlist.json` 中启用的仓库 | Must |
+| ISW-02 | 识别标题包含触发关键词（默认「【new-image】」）的 open issue | Must |
+| ISW-03 | 从 issue 标题和正文解析出软件包名、源码仓库 URL、所属领域 | Must |
+| ISW-04 | 按所属领域自动映射到目标分类目录（如"云原生"→`Cloud`） | Must |
+| ISW-05 | 用本地 state 文件（`dispatched_issues.json`）按 issue 号去重，避免重复触发 | Must |
+| ISW-06 | 每次运行最多处理 `max_events_per_run` 条 issue，防止 Action 超时 | Should |
+| ISW-07 | 解析信息不足（无法提取包名或源码仓库）时跳过，不强行 dispatch | Must |
+
+**镜像文件生成：**
+
+| 需求 ID | 需求描述 | 优先级 |
+|---------|---------|--------|
+| IMG-01 | 克隆目标仓库的 Fork，在本地生成 Dockerfile、meta.yml、README.md、doc/image-info.yml、logo | Must |
+| IMG-02 | 自动研究上游软件包的最新版本、构建语言、License、依赖信息 | Must |
+| IMG-03 | 参考仓库内同分类目录下的已有软件包，保持文件风格与规范一致 | Must |
+| IMG-04 | Dockerfile 必须同时支持 amd64 和 arm64 架构 | Must |
+| IMG-05 | 只创建新文件，不修改仓库内任何已有软件包的文件 | Must |
+| IMG-06 | 更新对应分类目录下的 `image-list.yml` 索引 | Must |
+| IMG-07 | 生成结果以 commit 形式提交到独立的 `add-{package_name}` 分支，并自动创建 PR | Must |
+| IMG-08 | PR 正文关联原始 issue（`Closes #{issue_number}`） | Must |
+| IMG-09 | 生成成功后在原始 issue 评论 PR 链接并打 `image-created` label；失败则评论说明并附 workflow 日志链接 | Must |
+| IMG-10 | Logo 缺失官方图时需 fallback 生成占位图，不得使用 AI 生成图像 | Should |
+
 ---
 
 ## 六、非功能需求
