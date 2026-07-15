@@ -46,8 +46,6 @@ env:
 jobs:
   create-image:
     runs-on: ubuntu-latest
-    container:
-      image: python:3.11
     timeout-minutes: 60
 
     steps:
