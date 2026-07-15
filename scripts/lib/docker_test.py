@@ -89,8 +89,8 @@ def get_image_size(tag: str) -> Optional[int]:
 
 
 def stop_and_remove_container(name: str):
-    run_cmd(f'docker stop {name} 2>/dev/null', timeout=10)
-    run_cmd(f'docker rm -f {name} 2>/dev/null', timeout=10)
+    run_cmd(f'docker stop -t 5 {name} 2>/dev/null', timeout=30)
+    run_cmd(f'docker rm -f {name} 2>/dev/null', timeout=30)
 
 
 def remove_image(tag: str):
