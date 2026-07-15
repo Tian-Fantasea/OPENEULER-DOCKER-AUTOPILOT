@@ -106,6 +106,8 @@ def main():
             f.write(f"version={result.get('version', 'unknown')}\n")
             f.write(f"category={result.get('category', category)}\n")
             f.write(f"tag={result.get('tag', '')}\n")
+            f.write(f"dockerfile_path={result.get('dockerfile_path', '')}\n")
+            f.write(f"binary_name={result.get('binary_name', '')}\n")
             f.write(f"success={str(result.get('success', False)).lower()}\n")
 
 

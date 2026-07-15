@@ -45,7 +45,7 @@ env:
 
 jobs:
   create-image:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     container:
       image: python:3.11
     timeout-minutes: 60
@@ -107,9 +107,20 @@ jobs:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
         run: python scripts/stages/create-image.py
 
+      # ── 6.5. Build and test image ────────────────────────────────
+      - name: Build and test image
+        id: image_test
+        if: steps.create_image.outputs.success == 'true'
+        env:
+          PACKAGE_NAME:   ${{ steps.create_image.outputs.package_name }}
+          VERSION:        ${{ steps.create_image.outputs.version }}
+          CATEGORY:       ${{ steps.create_image.outputs.category }}
+          IMAGE_REPO_DIR: ${{ github.workspace }}/image-repo
+        run: python scripts/stages/image-test.py
+
       # ── 7. Git: commit & push to new branch ──────────────────────
       - name: Commit and push to new branch
-        if: steps.create_image.outputs.success == 'true'
+        if: steps.create_image.outputs.success == 'true' && steps.image_test.outputs.passed == 'true'
         id: git_push
         run: |
           cd image-repo
@@ -135,7 +146,7 @@ jobs:
 
       # ── 8. Create PR on GitCode ───────────────────────────────────
       - name: Create Pull Request
-        if: steps.create_image.outputs.success == 'true'
+        if: steps.create_image.outputs.success == 'true' && steps.image_test.outputs.passed == 'true'
         id: create_pr
         env:
           BRANCH:       ${{ steps.git_push.outputs.branch }}
@@ -202,6 +213,7 @@ jobs:
         env:
           PR_URL:       ${{ steps.create_pr.outputs.pr_url }}
           SUCCESS:      ${{ steps.create_image.outputs.success }}
+          TEST_ERROR:   ${{ steps.image_test.outputs.test_error }}
           PACKAGE_NAME: ${{ steps.create_image.outputs.package_name || env.PACKAGE_NAME }}
         run: |
           python - <<'EOF'
@@ -222,6 +234,7 @@ jobs:
           if success and pr_url:
               body = (
                   f"🤖 已自动为 **{pkg}** 创建 PR：{pr_url}\n\n"
+                  f"镜像构建和功能测试已通过 ✅\n"
                   f"请 review 后合并，或根据需要调整 Dockerfile 内容。"
               )
               done_label = os.environ.get('DONE_LABEL', 'image-created')
@@ -229,6 +242,13 @@ jobs:
                   f"{GITCODE_BASE}/api/v5/repos/{owner}/{name}/issues/{issue_num}/labels",
                   params={'access_token': token},
                   json=[done_label], timeout=30,
+              )
+          elif success and not pr_url:
+              test_error = os.environ.get('TEST_ERROR', '')
+              body = (
+                  f"⚠️ **{pkg}** 镜像构建或测试失败，未创建 PR。\n\n"
+                  f"失败原因: {test_error}\n\n"
+                  f"请查看 [workflow 日志]({run_url}) 了解详情，或手动创建。"
               )
           else:
               body = (

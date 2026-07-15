@@ -341,6 +341,8 @@ img.save('logo.png')
   "version": "{latest_version}",
   "category": "{category}",
   "tag": "{version}-{os_tag}",
+  "dockerfile_path": "{category}/{package_name}/{version}/{os_version}/Dockerfile",
+  "binary_name": "{主二进制名称，如 dataset-controller}",
   "files_created": [
     "{category}/{package_name}/{version}/{os_version}/Dockerfile",
     "{category}/{package_name}/meta.yml",

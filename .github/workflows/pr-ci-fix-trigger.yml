@@ -30,7 +30,7 @@ jobs:
 
   # ── 阶段 1: CI 日志分析 ──────────────────────────────────────────
   ci-log-analysis:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     container:
       image: python:3.11
     if: |
@@ -113,7 +113,7 @@ jobs:
 
   # ── 阶段 2: 代码修复 ────────────────────────────────────────────
   code-fix:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     container:
       image: python:3.11
     if: |

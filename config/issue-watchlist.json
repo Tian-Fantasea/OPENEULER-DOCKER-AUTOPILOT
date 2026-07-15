@@ -2,7 +2,7 @@
   "watched_repos": [
     {
       "repo": "https://gitcode.com/openeuler/openeuler-docker-images",
-      "fork_repo": "sunshuang1866/openeuler-docker-images",
+      "fork_repo": "Tian-Fantasea/openeuler-docker-images",
       "base_branch": "master",
       "trigger_title_keyword": "【new-image】",
       "creating_label": "image-creating",

@@ -20,7 +20,7 @@ env:
 
 jobs:
   monitor:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     container:
       image: python:3.11
     timeout-minutes: 10
