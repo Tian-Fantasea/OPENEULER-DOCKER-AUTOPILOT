@@ -40,7 +40,7 @@ def run_container(image: str, name: str, ports: Optional[List[str]] = None, env:
     }
     port_args = ' '.join([f'-p {p}' for p in (ports or [])])
     env_args = ' '.join([f'-e {k}={v}' for k, v in (env or {}).items()])
-    cmd = f'docker run -d --name {name} {port_args} {env_args} {image}'
+    cmd = f'docker run -d --name {name} --entrypoint tail {port_args} {env_args} {image} -f /dev/null'
     code, out, err = run_cmd(cmd, timeout=30)
     ret['success'] = (code == 0)
     ret['container_id'] = out

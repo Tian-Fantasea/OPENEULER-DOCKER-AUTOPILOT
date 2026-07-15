@@ -69,24 +69,11 @@ set -e
 # 软件包: {package_name}
 # 版本: {version}
 # 类型: {软件类型}
+# 容器以 tail -f /dev/null 保持存活，直接用 docker exec 验证
 
 CONTAINER_NAME="test-${PACKAGE_NAME}"
 BINARY="{binary_name}"
 EXPECTED_VERSION="{version}"
-TIMEOUT=30
-
-# 等待容器启动
-wait_for_container() {
-    local elapsed=0
-    while [ $elapsed -lt $TIMEOUT ]; do
-        if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
-            return 0
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    return 1
-}
 
 # 测试1: 版本号验证
 test_version() {
@@ -104,22 +91,21 @@ test_version() {
     fi
 }
 
-# 测试2: 端口监听验证（如有 EXPOSE）
-test_port() {
-    # {根据 Dockerfile 的 EXPOSE 填写端口号}
-    local port={port}
-    if docker exec "${CONTAINER_NAME}" ss -tlnp 2>/dev/null | grep -q ":${port}"; then
-        echo "PASS: port ${port} is listening"
+# 测试2: 二进制存在验证
+test_binary_exists() {
+    if docker exec "${CONTAINER_NAME}" which {binary} >/dev/null 2>&1 || \
+       docker exec "${CONTAINER_NAME}" ls /usr/local/bin/{binary} >/dev/null 2>&1; then
+        echo "PASS: binary exists"
         return 0
     else
-        echo "FAIL: port ${port} is not listening"
+        echo "FAIL: binary not found"
         return 1
     fi
 }
 
-# 测试3: 基本功能验证
+# 测试3: 基本功能验证（根据软件定制）
 test_function() {
-    # {根据软件功能定制}
+    # {根据软件功能定制，例如：docker exec ${CONTAINER_NAME} {binary} --help}
     echo "PASS: basic function test"
     return 0
 }
@@ -127,13 +113,11 @@ test_function() {
 # 主流程
 main() {
     local failures=0
-    
-    wait_for_container || { echo "FAIL: container did not start"; exit 1; }
-    
+
+    test_binary_exists || failures=$((failures + 1))
     test_version || failures=$((failures + 1))
-    test_port || failures=$((failures + 1))
     test_function || failures=$((failures + 1))
-    
+
     if [ $failures -eq 0 ]; then
         echo "ALL_TESTS_PASSED"
         exit 0
@@ -177,10 +161,12 @@ main "$@"
 ## 三、核心约束
 
 - **test.sh 必须与 Dockerfile 在同一目录**
+- **容器以 `tail -f /dev/null` 保持存活**：容器启动时 entrypoint 被覆盖为 `tail -f /dev/null`，确保容器不会退出。test.sh 中所有验证命令通过 `docker exec` 在容器内执行实际二进制
+- **不要在 test.sh 中检查容器是否存活**：容器已保证存活，直接用 `docker exec` 执行验证命令
 - **测试脚本中容器名固定为 `test-${PACKAGE_NAME}`**，与 `image-test.py` 的启动参数一致
 - **所有测试用 `set -e`**，任一步骤失败立即退出
 - **版本号验证使用模糊匹配**（grep），不要求完全一致
-- **端口验证基于 Dockerfile 的 EXPOSE 声明**，没有 EXPOSE 则跳过端口测试
+- **端口验证方式**：对于服务类镜像，在 test.sh 中用 `docker exec -d {CONTAINER_NAME} {启动命令}` 后台启动服务，等待几秒后检查端口
 - **功能测试要最小化**，只需验证核心功能可用，不需要完整集成测试
 - **禁止在 test.sh 中执行 docker build 或 docker run**，这些由 `image-test.py` 统一管理
 - **test.sh 只负责容器内功能验证**，容器生命周期由 `image-test.py` 控制
