@@ -3,6 +3,40 @@ name: "create-image: 新增上游软件包镜像"
 on:
   repository_dispatch:
     types: [create-image]
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: '软件包名称'
+        required: true
+        default: 'test-pkg'
+      source_repo_url:
+        description: '上游源码仓库地址'
+        required: true
+        default: 'https://github.com/kubernetes/kubectl'
+      domain:
+        description: '所属领域'
+        required: true
+        default: '云原生'
+      category:
+        description: '分类目录'
+        required: true
+        default: 'Cloud'
+      repo:
+        description: '目标仓库 (owner/repo)'
+        required: true
+        default: 'openeuler/openeuler-docker-images'
+      fork_repo:
+        description: 'fork仓库 (owner/repo)'
+        required: true
+        default: 'Tian-Fantasea/openeuler-docker-images'
+      base_branch:
+        description: '基础分支'
+        required: true
+        default: 'master'
+      issue_number:
+        description: 'Issue编号 (0=测试)'
+        required: true
+        default: '0'
 
 # 同一个软件包串行，避免并发冲突
 concurrency:
@@ -27,16 +61,16 @@ env:
   OPENAI_BASE_URL:  ${{ vars.OPENAI_BASE_URL || '' }}
 
   # ── 任务参数（来自 dispatch payload）────────────────────────────
-  PACKAGE_NAME:     ${{ github.event.client_payload.package_name }}
-  SOURCE_REPO_URL:  ${{ github.event.client_payload.source_repo_url }}
-  DOMAIN:           ${{ github.event.client_payload.domain }}
-  CATEGORY:         ${{ github.event.client_payload.category }}
+  PACKAGE_NAME:     ${{ github.event.client_payload.package_name || github.event.inputs.package_name }}
+  SOURCE_REPO_URL:  ${{ github.event.client_payload.source_repo_url || github.event.inputs.source_repo_url }}
+  DOMAIN:           ${{ github.event.client_payload.domain || github.event.inputs.domain }}
+  CATEGORY:         ${{ github.event.client_payload.category || github.event.inputs.category }}
   OS_VERSION:       ${{ vars.OS_VERSION || '24.03-lts-sp3' }}
   OS_TAG:           ${{ vars.OS_TAG || 'oe2403sp3' }}
-  SOURCE_REPO:      ${{ github.event.client_payload.repo }}
-  FORK_REPO:        ${{ github.event.client_payload.fork_repo }}
-  BASE_BRANCH:      ${{ github.event.client_payload.base_branch || 'master' }}
-  ISSUE_NUMBER:     ${{ github.event.client_payload.issue_number }}
+  SOURCE_REPO:      ${{ github.event.client_payload.repo || github.event.inputs.repo }}
+  FORK_REPO:        ${{ github.event.client_payload.fork_repo || github.event.inputs.fork_repo }}
+  BASE_BRANCH:      ${{ github.event.client_payload.base_branch || github.event.inputs.base_branch || 'master' }}
+  ISSUE_NUMBER:     ${{ github.event.client_payload.issue_number || github.event.inputs.issue_number }}
   DONE_LABEL:       ${{ github.event.client_payload.done_label || 'image-created' }}
   CREATING_LABEL:   ${{ github.event.client_payload.creating_label || 'image-creating' }}
   GITCODE_TOKEN:    ${{ secrets.GITCODE_TOKEN }}
