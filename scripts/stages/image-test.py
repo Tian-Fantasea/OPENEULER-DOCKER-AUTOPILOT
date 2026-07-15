@@ -222,12 +222,20 @@ def main():
             capture_output=True, text=True, timeout=120, env=test_env,
         )
         custom_success = (proc.returncode == 0)
+        test_output = (proc.stdout + proc.stderr)[-2000:]
         test_result['tests'].append({
             'name': 'custom_test',
             'success': custom_success,
-            'log': (proc.stdout + proc.stderr)[-2000:],
+            'log': test_output,
         })
-        log(f"  {'✅' if custom_success else '❌'} Custom test {'passed' if custom_success else 'failed'}")
+        if custom_success:
+            log("  ✅ Custom test passed")
+        else:
+            log(f"  ❌ Custom test failed")
+            log(f"  --- test.sh output ---")
+            for line in test_output.split('\n'):
+                log(f"  | {line}")
+            log(f"  --- end output ---")
     else:
         log("Step 5: Skipped (no custom test.sh)")
 
