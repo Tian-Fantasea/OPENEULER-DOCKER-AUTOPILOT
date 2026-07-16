@@ -64,6 +64,7 @@
 ```bash
 #!/bin/bash
 set -e
+set -o pipefail
 
 # === 由 image-tester Agent 生成 ===
 # 软件包: {package_name}
@@ -71,11 +72,11 @@ set -e
 # 类型: {软件类型}
 # 容器以 tail -f /dev/null 保持存活，直接用 docker exec 验证
 
-CONTAINER_NAME="test-${PACKAGE_NAME}"
+CONTAINER_NAME="test-${PACKAGE_NAME:-{package_name}}"
 BINARY="{binary_name}"
 EXPECTED_VERSION="{version}"
 
-# 测试1: 版本号验证（宽松匹配）
+# 测试1: 版本号验证
 test_version() {
     local output
     output=$(docker exec "${CONTAINER_NAME}" {binary} --version 2>&1 || \
@@ -90,8 +91,14 @@ test_version() {
         echo "PASS: version check - ${output}"
         return 0
     fi
-    echo "WARN: version check - expected ${EXPECTED_VERSION}, got: ${output} (source-built binaries may not have version injected)"
-    echo "PASS: version check (binary runs and produces output)"
+    # Check if output contains any version-like pattern (e.g. v1.2.3 or 1.2.3)
+    if echo "${output}" | grep -qE 'v?[0-9]+\.[0-9]+\.[0-9]+'; then
+        echo "FAIL: version check - expected ${EXPECTED_VERSION}, got: ${output}"
+        return 1
+    fi
+    # No version pattern found - likely source-built without version injection
+    echo "WARN: version check - no version pattern in output: ${output}"
+    echo "PASS: version check (binary runs, no version injected)"
     return 0
 }
 

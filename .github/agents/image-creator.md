@@ -144,12 +144,15 @@ CMD ["./{binary}"]
 - **`ARG VERSION` 必须全大写**：版本变量名固定为 `VERSION`（不得写成 `version`、`Ver` 等），且其默认值必须与 meta.yml 中的版本号完全一致
 - 使用 `dnf` (openEuler 24.03) 而非 `apt`
 - Go 下载地址用 `https://golang.google.cn/dl/` (中国镜像)
+- **Go 版本必须使用已发布的稳定版本**：通过 `gh api repos/golang/go/tags --jq '.[].name' | head -20` 查询最新已发布版本，不得使用未发布或预发布版本。参考同仓库其他 Dockerfile 使用的 Go 版本作为基准
 - 最后一定要 `dnf clean all` 清理缓存
+- **构建工具必须在同一 RUN 层中清理**：`gcc`、`make`、`curl` 等仅用于编译/下载的工具，必须在编译完成后的同一 RUN 指令末尾执行 `dnf remove -y gcc make curl` 清理，避免残留增大镜像体积
 - 支持 amd64 和 arm64，通过 `${TARGETARCH}` 区分
 - **ARG 不是 shell 变量**：下载 URL 中不能写 `${VERSION}`，必须在 ARG 行定义默认值后用 `${VERSION}` 引用，或直接硬编码版本号在 URL 里（ARG 只在 RUN 中生效）
-- **dnf remove 仅限 `wget gcc make`**：不得移除 `git`、`cmake`、`python3` 等，否则会级联卸载 systemd 等系统组件
+- **dnf remove 仅限 `wget gcc make curl`**：不得移除 `git`、`cmake`、`python3` 等，否则会级联卸载 systemd 等系统组件
 - **`groupadd`/`useradd` 加 `2>/dev/null || true`**：避免用户已存在时报错中断构建
 - **`ENTRYPOINT` 和 `CMD` 都要写**：有明确入口点时两者并用
+- **下载二进制后验证 checksum**：如上游提供 checksum，在 Dockerfile 中添加验证步骤
 
 **openEuler 包名映射（Debian→RPM）：**
 
@@ -407,7 +410,7 @@ img.save('logo.png')
 - **README Usage 结构完整**：必须包含 pull / run / logs / exec 四个标准环节及启动参数表格
 - **image-info.yml 字段顺序强制**：name → category → description → environment → tags → download → usage → license → similar_packages → dependency → homepage → upstream，不得调换
 - **similar_packages 至少 3 条**：列举同类软件及简短中文说明
-- **dnf/yum remove 仅限 `wget gcc make`**：禁止移除 git、cmake、python3 等，否则级联破坏系统
+- **dnf/yum remove 仅限 `wget gcc make curl`**：禁止移除 git、cmake、python3 等，否则级联破坏系统
 - **禁止修改上游构建配置**：不得改动 go.mod、CMakeLists.txt 等以降级依赖，应从官方源下载合适版本的工具链
 - **logo 禁止 AI 生成**：找不到官方 logo 时用 Pillow 生成 400×200px 白底黑字图片
 - **logo 必须是官方图**：优先从上游仓库 `docs/` 目录下寻找含 logo/icon 关键词的图片，不得使用随机图片或 AI 生成图
@@ -415,3 +418,7 @@ img.save('logo.png')
 - **version_filter 必须完整**：image-info.yml 中固定写 `version_filter: alpha;rc;candidate;beta;pre`，不得遗漏任何预发布关键词
 - **ARG VERSION 必须全大写且与 meta.yml 一致**：Dockerfile 中版本 ARG 名称固定为 `VERSION`（全大写），其默认值必须与 meta.yml 中的版本键完全相同
 - **README usage 与 image-info.yml usage 内容一致**：两者步骤、命令、参数说明相同；image-info.yml 中 `usage` 使用 YAML 块标量（`|`），缩进一致，不含破坏 YAML 解析的裸冒号或引号
+- **Go 版本必须已发布**：通过 `gh api repos/golang/go/tags --jq '.[].name' | head -20` 查询已发布的 Go 版本，不得使用未发布版本。参考同仓库其他 Dockerfile 的 Go 版本作为基准
+- **构建工具必须清理**：`gcc`、`make`、`curl` 等仅用于编译/下载的工具，必须在编译完成后的同一 RUN 层末尾 `dnf remove -y` 清理
+- **name 字段必须与目录名一致**：image-info.yml 的 `name` 值必须与 `image_repo_dir` 下的目录名（即 `{package_name}`）完全一致，不得使用上游项目名或二进制名
+- **CLI 工具的 README 适配**：对于"运行即退出"的 CLI 工具镜像（如 kubectl、helm），README 的 Usage 部分应使用 `docker run --rm` 而非 `docker run -d`，且不需要 `docker logs` 和 `docker exec` 环节，改为直接运行命令的示例
