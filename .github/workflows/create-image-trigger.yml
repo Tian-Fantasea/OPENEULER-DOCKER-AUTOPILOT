@@ -174,7 +174,7 @@ jobs:
 
           git remote set-url origin \
             https://oauth2:${{ secrets.GITCODE_TOKEN }}@gitcode.com/${FORK_REPO}.git
-          git push origin "$BRANCH"
+          git push --force origin "$BRANCH"
           echo "✅ Pushed branch $BRANCH"
 
       # ── 8. Create PR on GitCode ───────────────────────────────────
