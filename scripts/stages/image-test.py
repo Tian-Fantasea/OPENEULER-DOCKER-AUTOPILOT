@@ -155,6 +155,10 @@ def main():
 
     if not build_result['success']:
         log("❌ Docker build failed")
+        log("  --- build log ---")
+        for line in build_result['log'][-2000:].split('\n'):
+            log(f"  | {line}")
+        log("  --- end log ---")
         test_result['error'] = 'docker build failed'
         _write_result(test_result, image_repo_dir)
         return
