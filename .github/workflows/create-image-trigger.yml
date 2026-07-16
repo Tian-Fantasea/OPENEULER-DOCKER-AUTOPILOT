@@ -170,7 +170,7 @@ jobs:
           git add ${CATEGORY}/
           git status
 
-          git commit -m "Feat: add ${{ steps.create_image.outputs.package_name }} ${{ steps.create_image.outputs.version }} docker image on openEuler ${OS_VERSION^^}"
+          git commit -s -m "Feat: add ${{ steps.create_image.outputs.package_name }} ${{ steps.create_image.outputs.version }} docker image on openEuler ${OS_VERSION^^}"
 
           git remote set-url origin \
             https://oauth2:${{ secrets.GITCODE_TOKEN }}@gitcode.com/${FORK_REPO}.git
